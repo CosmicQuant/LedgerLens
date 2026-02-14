@@ -427,411 +427,416 @@ function addThumbnailToQueue(id, thumbUrl, status, firestoreData) {
 
   const iconSparkle = document.createElement('span');
   iconSparkle.className = 'status-icon material-symbols-rounded icon-sparkle';
-  iconSparkle.textContent = 'auto_awesome';
-  function updateThumbnailStatus(id, status, firestoreData) {
-    const card = document.getElementById(`q-${id}`);
-    if (!card) return;
-    applyCardState(card, status);
-    if (firestoreData) card._firestoreData = firestoreData;
+  div.appendChild(iconSparkle);
+
+  // Prepend to list (newest first)
+  $queueList.insertBefore(div, $queueList.firstChild);
+}
+
+function updateThumbnailStatus(id, status, firestoreData) {
+  const card = document.getElementById(`q-${id}`);
+  if (!card) return;
+  applyCardState(card, status);
+  if (firestoreData) card._firestoreData = firestoreData;
+}
+
+function applyCardState(card, status) {
+  card.classList.remove('uploading', 'synced', 'extracted');
+  switch (status) {
+    case 'pending_upload':
+      // Blue border (default CSS)
+      break;
+    case 'uploading':
+      card.classList.add('uploading');
+      break;
+    case 'synced':
+      card.classList.add('synced');
+      break;
+    case 'extracted':
+      card.classList.add('extracted');
+      break;
   }
+}
 
-  function applyCardState(card, status) {
-    card.classList.remove('uploading', 'synced', 'extracted');
-    switch (status) {
-      case 'pending_upload':
-        // Blue border (default CSS)
-        break;
-      case 'uploading':
-        card.classList.add('uploading');
-        break;
-      case 'synced':
-        card.classList.add('synced');
-        break;
-      case 'extracted':
-        card.classList.add('extracted');
-        break;
-    }
-  }
+function updateFinishButton() {
+  // Uses in-memory pendingCount (reliable even after Delete-on-Success clears IDB)
+  $btnFinish.disabled = pendingCount > 0;
+}
 
-  function updateFinishButton() {
-    // Uses in-memory pendingCount (reliable even after Delete-on-Success clears IDB)
-    $btnFinish.disabled = pendingCount > 0;
-  }
+// ────────────────────────────────────────────────────────
+// 9. Upload Engine — Background Sync
+// ────────────────────────────────────────────────────────
+async function uploadPending() {
+  if (isUploading) return;
+  isUploading = true;
+  $syncInd.classList.add('uploading');
 
-  // ────────────────────────────────────────────────────────
-  // 9. Upload Engine — Background Sync
-  // ────────────────────────────────────────────────────────
-  async function uploadPending() {
-    if (isUploading) return;
-    isUploading = true;
-    $syncInd.classList.add('uploading');
+  const database = await getIDB();
+  let pending = await database.getAllFromIndex(STORE_NAME, 'status', 'pending_upload');
+  // Filter to current batch
+  pending = pending.filter(r => r.batchId === batchId);
 
-    const database = await getIDB();
-    let pending = await database.getAllFromIndex(STORE_NAME, 'status', 'pending_upload');
-    // Filter to current batch
-    pending = pending.filter(r => r.batchId === batchId);
-
-    // If nothing to upload, schedule next check and exit
-    if (pending.length === 0) {
-      isUploading = false;
-      $syncInd.classList.remove('uploading');
-      scheduleUpload(15000); // idle check
-      return;
-    }
-
-    for (const receipt of pending) {
-      try {
-        // Mark uploading
-        receipt.status = 'uploading';
-        await database.put(STORE_NAME, receipt);
-        updateThumbnailStatus(receipt.id, 'uploading');
-
-        // Upload WebP blob to Firebase Storage with Progress
-        const storagePath = `receipts/${batchId}/${receipt.id}.webp`;
-        const ref = storage.ref(storagePath);
-        const task = ref.put(receipt.blob, { contentType: 'image/webp' });
-
-        // Promisify the upload task
-        await new Promise((resolve, reject) => {
-          task.on('state_changed',
-            (snapshot) => {
-              const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-              updateThumbnailStatus(receipt.id, 'uploading', null, progress);
-            },
-            (error) => reject(error),
-            () => resolve()
-          );
-        });
-
-        const downloadUrl = await task.snapshot.ref.getDownloadURL();
-
-        // Write metadata to Firestore
-        await db.collection('batches').doc(batchId)
-          .collection('receipts').doc(receipt.id).set({
-            storageUrl: downloadUrl,
-            storagePath: storagePath,
-            status: 'synced',
-            extracted: false,
-            uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
-          });
-
-        // ── DELETE-ON-SUCCESS ──────────────────────────────
-        // Blob confirmed in Firebase Storage → purge from IDB to free memory.
-        await database.delete(STORE_NAME, receipt.id);
-
-        // Revoke the local ObjectURL to release the blob from browser memory
-        const oldUrl = activeObjectURLs.get(receipt.id);
-        if (oldUrl) {
-          URL.revokeObjectURL(oldUrl);
-          activeObjectURLs.delete(receipt.id);
-        }
-
-        // Update the card's image and status
-        const card = document.getElementById(`q-${receipt.id}`);
-        if (card) {
-          const img = card.querySelector('img');
-          if (img) img.src = downloadUrl;
-          card._firestoreData = { storageUrl: downloadUrl };
-        }
-
-        pendingCount = Math.max(0, pendingCount - 1);
-        updateThumbnailStatus(receipt.id, 'synced');
-
-        // Success? Reset backoff
-        uploadRetryDelay = 15000;
-
-      } catch (err) {
-        console.error(`Upload failed for ${receipt.id}:`, err);
-        receipt.status = 'pending_upload';
-        await database.put(STORE_NAME, receipt);
-        updateThumbnailStatus(receipt.id, 'pending_upload');
-
-        // Exponential Backoff
-        uploadRetryDelay = Math.min(uploadRetryDelay * 1.5, 300000); // cap at 5 mins
-        console.log(`Backing off upload for ${uploadRetryDelay}ms`);
-        break; // stop queue
-      }
-    }
-
+  // If nothing to upload, schedule next check and exit
+  if (pending.length === 0) {
     isUploading = false;
     $syncInd.classList.remove('uploading');
-    updateFinishButton();
-
-    // Schedule next run
-    scheduleUpload(pending.length > 0 ? 1000 : uploadRetryDelay);
+    scheduleUpload(15000); // idle check
+    return;
   }
 
-  function scheduleUpload(delay) {
-    if (uploadTimer) clearTimeout(uploadTimer);
-    uploadTimer = setTimeout(uploadPending, delay);
-  }
-
-  // Retry every 15 seconds
-  setInterval(() => {
-    if (!batchId) return;
-    uploadPending();
-  }, 15000);
-
-  // ────────────────────────────────────────────────────────
-  // 10. Firestore Listener — AI Extraction Updates
-  // ────────────────────────────────────────────────────────
-  function startExtractionListener() {
-    if (!batchId) return;
-    db.collection('batches').doc(batchId)
-      .collection('receipts')
-      .where('extracted', '==', true)
-      .onSnapshot(snapshot => {
-        snapshot.docChanges().forEach(change => {
-          if (change.type === 'added' || change.type === 'modified') {
-            const data = change.doc.data();
-            updateThumbnailStatus(change.doc.id, 'extracted', data);
-            // IDB record already deleted by Delete-on-Success — no update needed.
-          }
-        });
-      }, err => console.warn('Snapshot listener error:', err));
-  }
-
-  // ────────────────────────────────────────────────────────
-  // 11. Preview Modal
-  // ────────────────────────────────────────────────────────
-  async function openPreview(id, thumbUrl, firestoreData) {
-    $modal.style.display = 'flex';
-
-    // Revoke previous modal ObjectURL to prevent leak
-    if ($modalImg._objectUrl) {
-      URL.revokeObjectURL($modalImg._objectUrl);
-      $modalImg._objectUrl = null;
-    }
-
-    // Try IDB first (for un-uploaded images), fall back to remote URL
-    const database = await getIDB();
-    const rec = await database.get(STORE_NAME, id);
-    if (rec && rec.blob) {
-      const objUrl = URL.createObjectURL(rec.blob);
-      $modalImg._objectUrl = objUrl; // track for cleanup
-      $modalImg.src = objUrl;
-    } else if (firestoreData && firestoreData.storageUrl) {
-      $modalImg.src = firestoreData.storageUrl;
-    } else if (thumbUrl) {
-      $modalImg.src = thumbUrl;
-    }
-
-    // Fetch latest data from Firestore
-    let data = firestoreData;
+  for (const receipt of pending) {
     try {
-      const docSnap = await db.collection('batches').doc(batchId)
-        .collection('receipts').doc(id).get();
-      if (docSnap.exists) data = docSnap.data();
-    } catch (e) { /* offline, use cached */ }
+      // Mark uploading
+      receipt.status = 'uploading';
+      await database.put(STORE_NAME, receipt);
+      updateThumbnailStatus(receipt.id, 'uploading');
 
-    // XSS-SAFE: Build modal content with DOM APIs, never innerHTML with user/AI data
-    $modalData.textContent = ''; // Clear previous content safely
+      // Upload WebP blob to Firebase Storage with Progress
+      const storagePath = `receipts/${batchId}/${receipt.id}.webp`;
+      const ref = storage.ref(storagePath);
+      const task = ref.put(receipt.blob, { contentType: 'image/webp' });
 
-    if (data && data.extracted) {
-      const ext = data.extractedData || {};
-      const conf = ext.confidence_score ?? 0;
-      const confColor = conf >= 80 ? 'var(--success)' : 'var(--danger)';
-
-      const table = document.createElement('table');
-
-      // Helper: create a safe table row
-      function addRow(label, value) {
-        const tr = document.createElement('tr');
-        const tdLabel = document.createElement('td');
-        tdLabel.textContent = label;   // textContent is XSS-safe
-        const tdValue = document.createElement('td');
-        tdValue.textContent = value;   // textContent is XSS-safe
-        tr.appendChild(tdLabel);
-        tr.appendChild(tdValue);
-        table.appendChild(tr);
-        return tdValue; // in case caller needs to style it
-      }
-
-      addRow('Date', ext.date || '—');
-      addRow('Vendor', ext.vendor || '—');
-      addRow('Total', ext.total || '—');
-      addRow('Tax', ext.tax || '—');
-      addRow('Category', ext.category || '—');
-      addRow('Invoice #', ext.invoice_number || '—');
-
-      const dupCell = addRow('Duplicate', ext.flag_duplicate ? '⚠ YES' : 'No');
-      if (ext.flag_duplicate) dupCell.classList.add('flag-duplicate');
-
-      // Confidence row with progress bar
-      const confTr = document.createElement('tr');
-      const confLabel = document.createElement('td');
-      confLabel.textContent = 'Confidence';
-      const confValue = document.createElement('td');
-      confValue.textContent = `${conf}%`;
-
-      const barWrap = document.createElement('div');
-      barWrap.className = 'confidence-bar';
-      const barFill = document.createElement('div');
-      barFill.className = 'confidence-fill';
-      barFill.style.width = `${Math.min(Math.max(conf, 0), 100)}%`;
-      barFill.style.background = confColor;
-      barWrap.appendChild(barFill);
-      confValue.appendChild(barWrap);
-
-      confTr.appendChild(confLabel);
-      confTr.appendChild(confValue);
-      table.appendChild(confTr);
-
-      $modalData.appendChild(table);
-    } else {
-      const p = document.createElement('p');
-      p.className = 'modal-placeholder';
-      p.textContent = 'AI extraction pending…';
-      $modalData.appendChild(p);
-    }
-  }
-
-  $modalClose.addEventListener('click', () => {
-    $modal.style.display = 'none';
-    // Cleanup: revoke ObjectURL used by modal preview image
-    if ($modalImg._objectUrl) {
-      URL.revokeObjectURL($modalImg._objectUrl);
-      $modalImg._objectUrl = null;
-    }
-  });
-  $modal.addEventListener('click', (e) => {
-    if (e.target === $modal) {
-      $modal.style.display = 'none';
-      if ($modalImg._objectUrl) {
-        URL.revokeObjectURL($modalImg._objectUrl);
-        $modalImg._objectUrl = null;
-      }
-    }
-  });
-
-  // ────────────────────────────────────────────────────────
-  // 12. Finish Batch
-  // ────────────────────────────────────────────────────────
-  $btnFinish.addEventListener('click', async () => {
-    const confirmFinish = confirm(
-      `Finish batch for "${clientName}"?\n\nAll ${snapCounter} receipt(s) have been synced. The batch will be marked as complete.`
-    );
-    if (!confirmFinish) return;
-
-    try {
-      await db.collection('batches').doc(batchId).update({
-        status: 'completed',
-        completedAt: firebase.firestore.FieldValue.serverTimestamp(),
-        totalReceipts: snapCounter
-      });
-      showToast('Batch completed ✓', 'success');
-      $btnFinish.style.display = 'none';
-      $btnExport.style.display = 'flex';
-    } catch (err) {
-      showToast('Failed to finalize batch', 'error');
-      console.error(err);
-    }
-  });
-
-  // ────────────────────────────────────────────────────────
-  // 13. Export Excel
-  // ────────────────────────────────────────────────────────
-  $btnExport.addEventListener('click', async () => {
-    showToast('Generating Excel report…', 'info', 5000);
-    try {
-      // Get the current user's ID token for authenticated request
-      const idToken = await currentUser.getIdToken(true);
-
-      // Call the Cloud Function export endpoint with auth
-      const resp = await fetch(
-        `https://us-central1-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/export_batch`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${idToken}`
+      // Promisify the upload task
+      await new Promise((resolve, reject) => {
+        task.on('state_changed',
+          (snapshot) => {
+            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            updateThumbnailStatus(receipt.id, 'uploading', null, progress);
           },
-          body: JSON.stringify({ batch_id: batchId })
-        }
-      );
-      const result = await resp.json();
-      if (result.download_url) {
-        window.open(result.download_url, '_blank');
-        showToast('Excel report ready!', 'success');
-      } else {
-        throw new Error(result.error || 'Unknown error');
-      }
-    } catch (err) {
-      showToast('Export failed: ' + err.message, 'error');
-      console.error(err);
-    }
-  });
-
-  // ────────────────────────────────────────────────────────
-  // 14. Back / End Session
-  // ────────────────────────────────────────────────────────
-  $btnBack.addEventListener('click', () => {
-    const sure = confirm('Leave this session? Your local data is safe and will restore automatically.');
-    if (!sure) return;
-    stopCamera();
-    // Don't clear session — "lunch break" will restore it
-    showScreen($setup);
-  });
-
-  // ────────────────────────────────────────────────────────
-  // 15. Anonymous Authentication
-  // ────────────────────────────────────────────────────────
-  async function ensureAuth() {
-    return new Promise((resolve, reject) => {
-      // Listen for auth state changes
-      auth.onAuthStateChanged(async (user) => {
-        if (user) {
-          currentUser = user;
-          console.log('[Auth] Signed in:', user.uid);
-          resolve(user);
-        } else {
-          // No user — sign in anonymously
-          try {
-            const cred = await auth.signInAnonymously();
-            currentUser = cred.user;
-            console.log('[Auth] Anonymous sign-in:', cred.user.uid);
-            resolve(cred.user);
-          } catch (err) {
-            console.error('[Auth] Anonymous sign-in failed:', err);
-            showToast('Authentication failed', 'error');
-            reject(err);
-          }
-        }
+          (error) => reject(error),
+          () => resolve()
+        );
       });
-    });
+
+      const downloadUrl = await task.snapshot.ref.getDownloadURL();
+
+      // Write metadata to Firestore
+      await db.collection('batches').doc(batchId)
+        .collection('receipts').doc(receipt.id).set({
+          storageUrl: downloadUrl,
+          storagePath: storagePath,
+          status: 'synced',
+          extracted: false,
+          uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+
+      // ── DELETE-ON-SUCCESS ──────────────────────────────
+      // Blob confirmed in Firebase Storage → purge from IDB to free memory.
+      await database.delete(STORE_NAME, receipt.id);
+
+      // Revoke the local ObjectURL to release the blob from browser memory
+      const oldUrl = activeObjectURLs.get(receipt.id);
+      if (oldUrl) {
+        URL.revokeObjectURL(oldUrl);
+        activeObjectURLs.delete(receipt.id);
+      }
+
+      // Update the card's image and status
+      const card = document.getElementById(`q-${receipt.id}`);
+      if (card) {
+        const img = card.querySelector('img');
+        if (img) img.src = downloadUrl;
+        card._firestoreData = { storageUrl: downloadUrl };
+      }
+
+      pendingCount = Math.max(0, pendingCount - 1);
+      updateThumbnailStatus(receipt.id, 'synced');
+
+      // Success? Reset backoff
+      uploadRetryDelay = 15000;
+
+    } catch (err) {
+      console.error(`Upload failed for ${receipt.id}:`, err);
+      receipt.status = 'pending_upload';
+      await database.put(STORE_NAME, receipt);
+      updateThumbnailStatus(receipt.id, 'pending_upload');
+
+      // Exponential Backoff
+      uploadRetryDelay = Math.min(uploadRetryDelay * 1.5, 300000); // cap at 5 mins
+      console.log(`Backing off upload for ${uploadRetryDelay}ms`);
+      break; // stop queue
+    }
   }
 
-  // ────────────────────────────────────────────────────────
-  // 16. Init
-  // ────────────────────────────────────────────────────────
-  (async function init() {
-    // Show empty queue message
-    const emptyMsg = document.createElement('span');
-    emptyMsg.className = 'queue-empty';
-    emptyMsg.textContent = 'Snap a receipt to begin';
-    $queueList.appendChild(emptyMsg);
+  isUploading = false;
+  $syncInd.classList.remove('uploading');
+  updateFinishButton();
 
-    // SECURITY: Authenticate before any Firestore/Storage access
-    try {
-      await ensureAuth();
-    } catch (e) {
-      // Auth failed — stay on setup screen, user will see error toast
-      showScreen($setup);
-      return;
+  // Schedule next run
+  scheduleUpload(pending.length > 0 ? 1000 : uploadRetryDelay);
+}
+
+function scheduleUpload(delay) {
+  if (uploadTimer) clearTimeout(uploadTimer);
+  uploadTimer = setTimeout(uploadPending, delay);
+}
+
+// Retry every 15 seconds
+setInterval(() => {
+  if (!batchId) return;
+  uploadPending();
+}, 15000);
+
+// ────────────────────────────────────────────────────────
+// 10. Firestore Listener — AI Extraction Updates
+// ────────────────────────────────────────────────────────
+function startExtractionListener() {
+  if (!batchId) return;
+  db.collection('batches').doc(batchId)
+    .collection('receipts')
+    .where('extracted', '==', true)
+    .onSnapshot(snapshot => {
+      snapshot.docChanges().forEach(change => {
+        if (change.type === 'added' || change.type === 'modified') {
+          const data = change.doc.data();
+          updateThumbnailStatus(change.doc.id, 'extracted', data);
+          // IDB record already deleted by Delete-on-Success — no update needed.
+        }
+      });
+    }, err => console.warn('Snapshot listener error:', err));
+}
+
+// ────────────────────────────────────────────────────────
+// 11. Preview Modal
+// ────────────────────────────────────────────────────────
+async function openPreview(id, thumbUrl, firestoreData) {
+  $modal.style.display = 'flex';
+
+  // Revoke previous modal ObjectURL to prevent leak
+  if ($modalImg._objectUrl) {
+    URL.revokeObjectURL($modalImg._objectUrl);
+    $modalImg._objectUrl = null;
+  }
+
+  // Try IDB first (for un-uploaded images), fall back to remote URL
+  const database = await getIDB();
+  const rec = await database.get(STORE_NAME, id);
+  if (rec && rec.blob) {
+    const objUrl = URL.createObjectURL(rec.blob);
+    $modalImg._objectUrl = objUrl; // track for cleanup
+    $modalImg.src = objUrl;
+  } else if (firestoreData && firestoreData.storageUrl) {
+    $modalImg.src = firestoreData.storageUrl;
+  } else if (thumbUrl) {
+    $modalImg.src = thumbUrl;
+  }
+
+  // Fetch latest data from Firestore
+  let data = firestoreData;
+  try {
+    const docSnap = await db.collection('batches').doc(batchId)
+      .collection('receipts').doc(id).get();
+    if (docSnap.exists) data = docSnap.data();
+  } catch (e) { /* offline, use cached */ }
+
+  // XSS-SAFE: Build modal content with DOM APIs, never innerHTML with user/AI data
+  $modalData.textContent = ''; // Clear previous content safely
+
+  if (data && data.extracted) {
+    const ext = data.extractedData || {};
+    const conf = ext.confidence_score ?? 0;
+    const confColor = conf >= 80 ? 'var(--success)' : 'var(--danger)';
+
+    const table = document.createElement('table');
+
+    // Helper: create a safe table row
+    function addRow(label, value) {
+      const tr = document.createElement('tr');
+      const tdLabel = document.createElement('td');
+      tdLabel.textContent = label;   // textContent is XSS-safe
+      const tdValue = document.createElement('td');
+      tdValue.textContent = value;   // textContent is XSS-safe
+      tr.appendChild(tdLabel);
+      tr.appendChild(tdValue);
+      table.appendChild(tr);
+      return tdValue; // in case caller needs to style it
     }
 
-    const restored = await tryRestoreSession();
-    if (restored) {
-      startExtractionListener();
+    addRow('Date', ext.date || '—');
+    addRow('Vendor', ext.vendor || '—');
+    addRow('Total', ext.total || '—');
+    addRow('Tax', ext.tax || '—');
+    addRow('Category', ext.category || '—');
+    addRow('Invoice #', ext.invoice_number || '—');
+
+    const dupCell = addRow('Duplicate', ext.flag_duplicate ? '⚠ YES' : 'No');
+    if (ext.flag_duplicate) dupCell.classList.add('flag-duplicate');
+
+    // Confidence row with progress bar
+    const confTr = document.createElement('tr');
+    const confLabel = document.createElement('td');
+    confLabel.textContent = 'Confidence';
+    const confValue = document.createElement('td');
+    confValue.textContent = `${conf}%`;
+
+    const barWrap = document.createElement('div');
+    barWrap.className = 'confidence-bar';
+    const barFill = document.createElement('div');
+    barFill.className = 'confidence-fill';
+    barFill.style.width = `${Math.min(Math.max(conf, 0), 100)}%`;
+    barFill.style.background = confColor;
+    barWrap.appendChild(barFill);
+    confValue.appendChild(barWrap);
+
+    confTr.appendChild(confLabel);
+    confTr.appendChild(confValue);
+    table.appendChild(confTr);
+
+    $modalData.appendChild(table);
+  } else {
+    const p = document.createElement('p');
+    p.className = 'modal-placeholder';
+    p.textContent = 'AI extraction pending…';
+    $modalData.appendChild(p);
+  }
+}
+
+$modalClose.addEventListener('click', () => {
+  $modal.style.display = 'none';
+  // Cleanup: revoke ObjectURL used by modal preview image
+  if ($modalImg._objectUrl) {
+    URL.revokeObjectURL($modalImg._objectUrl);
+    $modalImg._objectUrl = null;
+  }
+});
+$modal.addEventListener('click', (e) => {
+  if (e.target === $modal) {
+    $modal.style.display = 'none';
+    if ($modalImg._objectUrl) {
+      URL.revokeObjectURL($modalImg._objectUrl);
+      $modalImg._objectUrl = null;
+    }
+  }
+});
+
+// ────────────────────────────────────────────────────────
+// 12. Finish Batch
+// ────────────────────────────────────────────────────────
+$btnFinish.addEventListener('click', async () => {
+  const confirmFinish = confirm(
+    `Finish batch for "${clientName}"?\n\nAll ${snapCounter} receipt(s) have been synced. The batch will be marked as complete.`
+  );
+  if (!confirmFinish) return;
+
+  try {
+    await db.collection('batches').doc(batchId).update({
+      status: 'completed',
+      completedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      totalReceipts: snapCounter
+    });
+    showToast('Batch completed ✓', 'success');
+    $btnFinish.style.display = 'none';
+    $btnExport.style.display = 'flex';
+  } catch (err) {
+    showToast('Failed to finalize batch', 'error');
+    console.error(err);
+  }
+});
+
+// ────────────────────────────────────────────────────────
+// 13. Export Excel
+// ────────────────────────────────────────────────────────
+$btnExport.addEventListener('click', async () => {
+  showToast('Generating Excel report…', 'info', 5000);
+  try {
+    // Get the current user's ID token for authenticated request
+    const idToken = await currentUser.getIdToken(true);
+
+    // Call the Cloud Function export endpoint with auth
+    const resp = await fetch(
+      `https://us-central1-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/export_batch`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ batch_id: batchId })
+      }
+    );
+    const result = await resp.json();
+    if (result.download_url) {
+      window.open(result.download_url, '_blank');
+      showToast('Excel report ready!', 'success');
     } else {
-      showScreen($setup);
+      throw new Error(result.error || 'Unknown error');
     }
-  })();
+  } catch (err) {
+    showToast('Export failed: ' + err.message, 'error');
+    console.error(err);
+  }
+});
 
-  // Start listener once we enter camera screen from setup
-  const cameraObserver = new MutationObserver(() => {
-    if ($camera.classList.contains('active')) {
-      startExtractionListener();
-    }
+// ────────────────────────────────────────────────────────
+// 14. Back / End Session
+// ────────────────────────────────────────────────────────
+$btnBack.addEventListener('click', () => {
+  const sure = confirm('Leave this session? Your local data is safe and will restore automatically.');
+  if (!sure) return;
+  stopCamera();
+  // Don't clear session — "lunch break" will restore it
+  showScreen($setup);
+});
+
+// ────────────────────────────────────────────────────────
+// 15. Anonymous Authentication
+// ────────────────────────────────────────────────────────
+async function ensureAuth() {
+  return new Promise((resolve, reject) => {
+    // Listen for auth state changes
+    auth.onAuthStateChanged(async (user) => {
+      if (user) {
+        currentUser = user;
+        console.log('[Auth] Signed in:', user.uid);
+        resolve(user);
+      } else {
+        // No user — sign in anonymously
+        try {
+          const cred = await auth.signInAnonymously();
+          currentUser = cred.user;
+          console.log('[Auth] Anonymous sign-in:', cred.user.uid);
+          resolve(cred.user);
+        } catch (err) {
+          console.error('[Auth] Anonymous sign-in failed:', err);
+          showToast('Authentication failed', 'error');
+          reject(err);
+        }
+      }
+    });
   });
-  cameraObserver.observe($camera, { attributes: true, attributeFilter: ['class'] });
+}
+
+// ────────────────────────────────────────────────────────
+// 16. Init
+// ────────────────────────────────────────────────────────
+(async function init() {
+  // Show empty queue message
+  const emptyMsg = document.createElement('span');
+  emptyMsg.className = 'queue-empty';
+  emptyMsg.textContent = 'Snap a receipt to begin';
+  $queueList.appendChild(emptyMsg);
+
+  // SECURITY: Authenticate before any Firestore/Storage access
+  try {
+    await ensureAuth();
+  } catch (e) {
+    // Auth failed — stay on setup screen, user will see error toast
+    showScreen($setup);
+    return;
+  }
+
+  const restored = await tryRestoreSession();
+  if (restored) {
+    startExtractionListener();
+  } else {
+    showScreen($setup);
+  }
+})();
+
+// Start listener once we enter camera screen from setup
+const cameraObserver = new MutationObserver(() => {
+  if ($camera.classList.contains('active')) {
+    startExtractionListener();
+  }
+});
+cameraObserver.observe($camera, { attributes: true, attributeFilter: ['class'] });
