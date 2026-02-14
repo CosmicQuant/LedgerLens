@@ -58,7 +58,7 @@ service cloud.firestore {
         allow create: if parentIsOwner();
         allow read:   if parentIsOwner();
         allow update: if parentIsOwner();
-        allow delete: if false;
+        allow delete: if parentIsOwner();
       }
     }
 

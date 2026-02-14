@@ -9,8 +9,8 @@ import os
 import uuid
 from datetime import datetime
 
-import pandas as pd
-from firebase_admin import auth, firestore, storage
+import firebase_admin
+from firebase_admin import auth, firestore, storage, initialize_app
 from firebase_functions import https_fn, options
 
 
@@ -54,13 +54,14 @@ def ensure_storage_token(blob) -> str:
 # ────────────────────────────────────────────────────────
 # Excel Generation Engine
 # ────────────────────────────────────────────────────────
-def generate_excel_report(batch_id: str) -> tuple[bytes, str]:
+def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
     """
     Queries all receipts for the batch, builds a formatted Excel workbook,
     and returns the bytes + suggested filename.
     """
 
     # ── 1. Fetch batch metadata ──────────────────────────
+    import pandas as pd
     batch_ref = db.collection("batches").document(batch_id)
     batch_doc = batch_ref.get()
     if not batch_doc.exists:
@@ -295,15 +296,29 @@ def verify_request_auth(req) -> dict:
     timeout_sec=300,
     max_instances=5,
     cors=options.CorsOptions(
-        cors_origins=["https://ledgerlens-b4050.web.app", "https://ledgerlens-b4050.firebaseapp.com"],
-        cors_methods=["POST"],
+        cors_origins="*", # Use explicit wildcard for broad compatibility
+        cors_methods=["POST", "OPTIONS"],
     ),
 )
 def export_batch(req: https_fn.Request) -> https_fn.Response:
     """
     HTTP Cloud Function to export a batch of receipts to an Excel file.
-    Expects 'batchId' in JSON body and a valid Firebase ID token in Authorization header.
     """
+    # ── MANUAL PREFLIGHT OVERRIDE ───────────────────────
+    if req.method == "OPTIONS":
+        return https_fn.Response(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Max-Age": "3600",
+            },
+        )
+    if not firebase_admin._apps:
+        initialize_app()
+    db = firestore.client()
+
     # ── SECURITY: Verify authentication ──────────────────
     try:
         decoded_token = verify_request_auth(req)
@@ -341,7 +356,7 @@ def export_batch(req: https_fn.Request) -> https_fn.Response:
             )
 
         # Generate the Excel report
-        excel_bytes, filename = generate_excel_report(batch_id)
+        excel_bytes, filename = generate_excel_report(batch_id, db)
 
         # Upload to Firebase Storage
         export_path = f"exports/{batch_id}/{filename}"

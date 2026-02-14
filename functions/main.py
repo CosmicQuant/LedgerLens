@@ -12,16 +12,11 @@ import json
 import os
 import re
 
-import google.generativeai as genai
+import firebase_admin
 from firebase_admin import credentials, firestore, initialize_app, storage
 from firebase_functions import options, storage_fn
 
-# ────────────────────────────────────────────────────────
-# Firebase Admin Init
-# ────────────────────────────────────────────────────────
-initialize_app()
 
-# db = firestore.client()  <-- MOVED INSIDE FUNCTIONS
 
 # Import export function so Firebase discovers it at deploy time
 from export import export_batch  # noqa: F401, E402
@@ -31,11 +26,9 @@ from export import export_batch  # noqa: F401, E402
 # ────────────────────────────────────────────────────────
 # The API key is stored in Firebase Secrets Manager and exposed
 # as an environment variable via firebase functions:secrets:set
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") <-- Configured locally
 
-GEMINI_MODEL = "gemini-1.5-flash"
+
 
 EXTRACTION_PROMPT = """You are a professional receipt/invoice data extraction AI.
 Analyze the receipt image provided and extract the following fields.
@@ -52,6 +45,7 @@ Return ONLY a valid JSON object with these exact keys:
 }
 
 Rules:
+- If the image is NOT a receipt or invoice, return a JSON with all fields empty strings/0 and set category to "Invalid".
 - Return raw numeric values for total and tax (e.g. 42.50 not "$42.50").
 - If a field is unreadable, use an empty string "" for text or 0 for numbers.
 - confidence_score: 90-100 if all fields clearly readable, 60-89 if some fields
@@ -60,35 +54,25 @@ Rules:
 """
 
 
-# ────────────────────────────────────────────────────────
-# Duplicate Detection Hash
-# ────────────────────────────────────────────────────────
-def compute_receipt_hash(data: dict) -> str:
-    """Generate a deterministic hash from key receipt fields for deduplication."""
-    raw = f"{data.get('vendor', '')}" \
-          f"|{data.get('date', '')}" \
-          f"|{data.get('total', '')}" \
-          f"|{data.get('invoice_number', '')}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-
-async def check_duplicate(batch_id: str, receipt_hash: str, current_receipt_id: str) -> bool:
-    """Check if another receipt in this batch already has the same hash."""
-    db = firestore.client()
-    batch_ref = db.collection("batches").document(batch_id).collection("receipts")
-    query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
-    for doc in query:
-        if doc.id != current_receipt_id:
-            return True
-    return False
 
 
 # ────────────────────────────────────────────────────────
 # Gemini Extraction
 # ────────────────────────────────────────────────────────
 def extract_receipt_data(image_bytes: bytes) -> dict:
-    """Send receipt image to Gemini 1.5 Flash and parse structured response."""
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    """Send receipt image to Gemini with fallback to smaller model if needed."""
+    import google.generativeai as genai
+    
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        genai.configure(api_key=api_key)
+
+    # Models to try in order of preference
+    models_to_try = [
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest"
+    ]
 
     # Build the image part for Gemini
     image_part = {
@@ -96,41 +80,50 @@ def extract_receipt_data(image_bytes: bytes) -> dict:
         "data": image_bytes,
     }
 
-    try:
-        response = model.generate_content(
-            [EXTRACTION_PROMPT, image_part],
-            generation_config=genai.GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=1024,
-            ),
-        )
+    for model_name in models_to_try:
+        try:
+            print(f"[Gemini] Attempting extraction with {model_name}...")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                [EXTRACTION_PROMPT, image_part],
+                generation_config=genai.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=1024,
+                ),
+            )
 
-        raw_text = response.text.strip()
+            raw_text = response.text.strip()
 
-        # Clean potential markdown fences
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-            raw_text = re.sub(r"\s*```$", "", raw_text)
+            # Clean potential markdown fences
+            if raw_text.startswith("```"):
+                raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+                raw_text = re.sub(r"\s*```$", "", raw_text)
 
-        data = json.loads(raw_text)
+            data = json.loads(raw_text)
 
-        # Validate / enforce schema
-        return {
-            "date":             str(data.get("date", "")),
-            "vendor":           str(data.get("vendor", "")),
-            "total":            _to_float(data.get("total", 0)),
-            "tax":              _to_float(data.get("tax", 0)),
-            "category":         str(data.get("category", "Miscellaneous")),
-            "invoice_number":   str(data.get("invoice_number", "")),
-            "confidence_score": int(data.get("confidence_score", 0)),
-        }
+            # Validate / enforce schema
+            return {
+                "date":             str(data.get("date", "")),
+                "vendor":           str(data.get("vendor", "")),
+                "total":            _to_float(data.get("total", 0)),
+                "tax":              _to_float(data.get("tax", 0)),
+                "category":         str(data.get("category", "Miscellaneous")),
+                "invoice_number":   str(data.get("invoice_number", "")),
+                "confidence_score": int(data.get("confidence_score", 0)),
+                "model_used":       model_name
+            }
 
-    except json.JSONDecodeError as e:
-        print(f"[Gemini] JSON parse error: {e} — raw: {raw_text[:500]}")
-        return _fallback_data(10)
-    except Exception as e:
-        print(f"[Gemini] Extraction error: {e}")
-        return _fallback_data(0)
+        except json.JSONDecodeError as e:
+            print(f"[Gemini] {model_name} parse error: {e}")
+            # Try next model or fallback
+            continue
+        except Exception as e:
+            print(f"[Gemini] {model_name} error: {e}")
+            # Try next model (quota, server error, etc)
+            continue
+
+    print("[Gemini] All models failed. Returning fallback data.")
+    return _fallback_data(0)
 
 
 def _to_float(val) -> float:
@@ -164,11 +157,13 @@ def _fallback_data(confidence: int) -> dict:
     max_instances=20,
     secrets=["GEMINI_API_KEY"],
 )
-def process_receipt(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]):
+def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]):
     """
     Triggered when a receipt image is uploaded to Firebase Storage.
     Expected path: receipts/{batch_id}/{receipt_id}.jpg
     """
+    if not firebase_admin._apps:
+        initialize_app()
     db = firestore.client()
     storage_client = storage.bucket(event.data.bucket)
 

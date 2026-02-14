@@ -56,7 +56,9 @@ let batchId = '';
 let snapCounter = 0;
 let pendingCount = 0;          // tracks images still uploading
 let mediaStream = null;
-let isUploading = false;
+window.isUploading = false;
+window.uploadTimer = null;         // Explicit global scope for sync variable
+window.uploadRetryDelay = 15000;    // Exponential backoff delay for sync
 
 // PERFORMANCE CRITICAL: Single reusable canvas for all snaps
 const captureCanvas = document.createElement('canvas');
@@ -72,9 +74,10 @@ const activeObjectURLs = new Map(); // id → objectURL
 const $setup = document.getElementById('screen-setup');
 const $camera = document.getElementById('screen-camera');
 const $formSetup = document.getElementById('form-setup');
-const $inputClient = document.getElementById('client-name');
+const $inputClient = document.getElementById('input-client');
 const $inputCycle = document.getElementById('input-cycle');
-const $btnStart = document.getElementById('btn-start-batch');
+const $btnStart = document.getElementById('btn-start');
+const $btnHistory = document.getElementById('btn-history');
 const $btnBack = document.getElementById('btn-back');
 const $lblClient = document.getElementById('lbl-client');
 const $lblBatch = document.getElementById('lbl-batch');
@@ -93,6 +96,7 @@ const $modalData = document.querySelector('.modal-data');
 const $modalClose = document.querySelector('.modal-close-btn');
 const $btnTorch = document.getElementById('btn-torch');
 const $btnTheme = document.getElementById('btn-theme-toggle');
+const $btnResetSession = document.getElementById('btn-reset-session');
 
 
 
@@ -143,6 +147,22 @@ function showScreen(screenEl) {
   screenEl.classList.add('active');
 }
 
+function initTheme() {
+  const savedTheme = localStorage.getItem('theme') || 'dark';
+  document.documentElement.setAttribute('data-theme', savedTheme);
+
+  if ($btnTheme) {
+    $btnTheme.innerHTML = `<span class="material-symbols-rounded">${savedTheme === 'dark' ? 'dark_mode' : 'light_mode'}</span>`;
+    $btnTheme.onclick = () => {
+      const current = document.documentElement.getAttribute('data-theme');
+      const next = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      $btnTheme.innerHTML = `<span class="material-symbols-rounded">${next === 'dark' ? 'dark_mode' : 'light_mode'}</span>`;
+    };
+  }
+}
+
 function fireFlash() {
   $flashFx.classList.remove('fire');
   void $flashFx.offsetWidth; // reflow
@@ -160,6 +180,23 @@ function saveSession() {
 function clearSession() {
   localStorage.removeItem('ll_client');
   localStorage.removeItem('ll_batch');
+  clientName = '';
+  batchId = '';
+}
+
+async function resetApp() {
+  const sure = confirm('This will end the current session. Your data already synced to the cloud is safe, but this device will start fresh. Proceed?');
+  if (!sure) return;
+
+  clearSession();
+  snapCounter = 0;
+  pendingCount = 0;
+  $snapCount.textContent = '0';
+  $queueList.innerHTML = '<span class="queue-empty">Snap a receipt to begin</span>';
+  if ($btnResetSession) $btnResetSession.style.display = 'none';
+
+  stopCamera();
+  showScreen($setup);
 }
 
 async function tryRestoreSession() {
@@ -173,18 +210,6 @@ async function tryRestoreSession() {
     showScreen($camera);
     await startCamera();
     await restoreQueueFromFirestore();
-    // Theme Init
-    const savedTheme = localStorage.getItem('theme') || 'dark';
-    document.documentElement.setAttribute('data-theme', savedTheme);
-
-    // Theme Toggle
-    $btnTheme.addEventListener('click', () => {
-      const current = document.documentElement.getAttribute('data-theme');
-      const next = current === 'dark' ? 'light' : 'dark';
-      document.documentElement.setAttribute('data-theme', next);
-      localStorage.setItem('theme', next);
-      $btnTheme.innerHTML = `<span class="material-symbols-rounded">${next === 'dark' ? 'dark_mode' : 'light_mode'}</span>`;
-    });
 
     // Check queue from IDB
     await restoreQueueFromIDB();
@@ -192,6 +217,7 @@ async function tryRestoreSession() {
     // Start upload loop with backoff
     scheduleUpload(5000);
     showToast('Session restored ✓', 'success');
+    if ($btnResetSession) $btnResetSession.style.display = 'flex';
     return true;
   }
   return false;
@@ -201,13 +227,19 @@ async function tryRestoreSession() {
 async function restoreQueueFromFirestore() {
   try {
     const snap = await db.collection('batches').doc(batchId)
-      .collection('receipts').get();
+      .collection('receipts').orderBy('uploadedAt', 'asc').get();
+
+    $queueList.innerHTML = ''; // Clear empty message/old state
+    let count = 0;
+
     snap.forEach(docSnap => {
       const d = docSnap.data();
       const status = d.extracted ? 'extracted' : 'synced';
       addThumbnailToQueue(docSnap.id, d.thumbUrl || d.storageUrl, status, d);
-      snapCounter++;
+      count++;
     });
+
+    snapCounter = count;
     $snapCount.textContent = snapCounter;
   } catch (err) {
     console.warn('Firestore restore failed (offline?):', err);
@@ -249,6 +281,12 @@ $formSetup.addEventListener('submit', async (e) => {
 
   batchId = `${clientName.replace(/\s+/g, '_')}_${cycle.replace(/\s+/g, '_')}_${uid()}`;
   saveSession();
+
+  // Clear UI from any previous restored session
+  $queueList.innerHTML = '';
+  snapCounter = 0;
+  pendingCount = 0;
+  $snapCount.textContent = '0';
 
   // Create batch document in Firestore with ownerId for access control
   try {
@@ -409,28 +447,86 @@ function addThumbnailToQueue(id, thumbUrl, status, firestoreData) {
   div.id = `q-${id}`;
   div.onclick = () => openPreview(id, thumbUrl, firestoreData);
 
+  // Inner wrapper for clipping
+  const inner = document.createElement('div');
+  inner.className = 'q-card-inner';
+  div.appendChild(inner);
+
   // Thumbnail
   const img = document.createElement('img');
   img.src = thumbUrl;
-  div.appendChild(img);
+  inner.appendChild(img);
 
   // Progress Bar
   const prog = document.createElement('div');
-  prog.className = 'progress-overlay';
-  div.appendChild(prog);
+  prog.className = 'q-prog-bar';
+  inner.appendChild(prog);
 
-  // Status Icons
+  // Status Icons (Check/Sparkle)
   const iconCheck = document.createElement('span');
-  iconCheck.className = 'status-icon material-symbols-rounded icon-check';
+  iconCheck.className = 'material-symbols-rounded status-icon icon-check';
   iconCheck.textContent = 'check_circle';
-  div.appendChild(iconCheck);
+  inner.appendChild(iconCheck);
 
   const iconSparkle = document.createElement('span');
-  iconSparkle.className = 'status-icon material-symbols-rounded icon-sparkle';
-  div.appendChild(iconSparkle);
+  iconSparkle.className = 'material-symbols-rounded status-icon icon-sparkle';
+  iconSparkle.textContent = 'auto_awesome';
+  inner.appendChild(iconSparkle);
+
+  // Delete Button
+  const btnDel = document.createElement('button');
+  btnDel.className = 'btn-card-del';
+  btnDel.innerHTML = '<span class="material-symbols-rounded">close</span>';
+  btnDel.title = 'Delete receipt';
+  btnDel.onclick = (e) => {
+    e.stopPropagation(); // Don't open preview
+    deleteReceipt(id);
+  };
+  div.appendChild(btnDel);
 
   // Prepend to list (newest first)
   $queueList.insertBefore(div, $queueList.firstChild);
+}
+
+async function deleteReceipt(id) {
+  const sure = confirm('Delete this receipt permanently?');
+  if (!sure) return;
+
+  const card = document.getElementById(`q-${id}`);
+  const storagePath = card?._firestoreData?.storagePath;
+
+  try {
+    // 1. Storage
+    if (storagePath) {
+      await storage.ref(storagePath).delete();
+    }
+
+    // 2. Firestore
+    await db.collection('batches').doc(batchId)
+      .collection('receipts').doc(id).delete();
+
+    // 3. IDB
+    const database = await getIDB();
+    await database.delete(STORE_NAME, id);
+
+    // 4. Memory / UI
+    if (activeObjectURLs.has(id)) {
+      URL.revokeObjectURL(activeObjectURLs.get(id));
+      activeObjectURLs.delete(id);
+    }
+    if (card) card.remove();
+
+    snapCounter = Math.max(0, snapCounter - 1);
+    $snapCount.textContent = snapCounter;
+
+    showToast('Receipt deleted', 'info');
+    if ($queueList.children.length === 0) {
+      $queueList.innerHTML = '<span class="queue-empty">Snap a receipt to begin</span>';
+    }
+  } catch (err) {
+    console.error('Delete failed:', err);
+    showToast('Failed to delete resource', 'error');
+  }
 }
 
 function updateThumbnailStatus(id, status, firestoreData) {
@@ -567,8 +663,8 @@ async function uploadPending() {
 }
 
 function scheduleUpload(delay) {
-  if (uploadTimer) clearTimeout(uploadTimer);
-  uploadTimer = setTimeout(uploadPending, delay);
+  if (window.uploadTimer) clearTimeout(window.uploadTimer);
+  window.uploadTimer = setTimeout(uploadPending, delay);
 }
 
 // Retry every 15 seconds
@@ -601,8 +697,18 @@ function startExtractionListener() {
 // ────────────────────────────────────────────────────────
 async function openPreview(id, thumbUrl, firestoreData) {
   $modal.style.display = 'flex';
+  // Don't set src immediately to avoid stale blob ERR_FILE_NOT_FOUND
+  $modalImg.src = '';
 
-  // Revoke previous modal ObjectURL to prevent leak
+  // Safety: If blob URL fails (e.g. revoked due to Delete-on-Success), fall back to remote
+  $modalImg.onerror = () => {
+    if (firestoreData && (firestoreData.storageUrl || firestoreData.thumbUrl)) {
+      $modalImg.src = firestoreData.storageUrl || firestoreData.thumbUrl;
+      $modalImg.onerror = null; // Prevent loops
+    }
+  };
+
+  $modalData.innerHTML = '<p class="modal-placeholder">AI extraction pending…</p>';
   if ($modalImg._objectUrl) {
     URL.revokeObjectURL($modalImg._objectUrl);
     $modalImg._objectUrl = null;
@@ -611,12 +717,13 @@ async function openPreview(id, thumbUrl, firestoreData) {
   // Try IDB first (for un-uploaded images), fall back to remote URL
   const database = await getIDB();
   const rec = await database.get(STORE_NAME, id);
+
   if (rec && rec.blob) {
     const objUrl = URL.createObjectURL(rec.blob);
-    $modalImg._objectUrl = objUrl; // track for cleanup
+    $modalImg._objectUrl = objUrl;
     $modalImg.src = objUrl;
-  } else if (firestoreData && firestoreData.storageUrl) {
-    $modalImg.src = firestoreData.storageUrl;
+  } else if (firestoreData && (firestoreData.storageUrl || firestoreData.thumbUrl)) {
+    $modalImg.src = firestoreData.storageUrl || firestoreData.thumbUrl;
   } else if (thumbUrl) {
     $modalImg.src = thumbUrl;
   }
@@ -635,59 +742,90 @@ async function openPreview(id, thumbUrl, firestoreData) {
   if (data && data.extracted) {
     const ext = data.extractedData || {};
     const conf = ext.confidence_score ?? 0;
-    const confColor = conf >= 80 ? 'var(--success)' : 'var(--danger)';
+    const form = document.createElement('div');
+    form.className = 'edit-form';
 
-    const table = document.createElement('table');
-
-    // Helper: create a safe table row
-    function addRow(label, value) {
-      const tr = document.createElement('tr');
-      const tdLabel = document.createElement('td');
-      tdLabel.textContent = label;   // textContent is XSS-safe
-      const tdValue = document.createElement('td');
-      tdValue.textContent = value;   // textContent is XSS-safe
-      tr.appendChild(tdLabel);
-      tr.appendChild(tdValue);
-      table.appendChild(tr);
-      return tdValue; // in case caller needs to style it
+    function addEditRow(label, value, id, type = 'text') {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      const lbl = document.createElement('label');
+      lbl.textContent = label;
+      const input = document.createElement(type === 'select' ? 'select' : 'input');
+      if (type !== 'select') {
+        input.type = type;
+        if (type === 'number') input.step = '0.01';
+        input.value = value || '';
+      }
+      input.id = `edit-${id}`;
+      row.appendChild(lbl);
+      row.appendChild(input);
+      form.appendChild(row);
+      return input;
     }
 
-    addRow('Date', ext.date || '—');
-    addRow('Vendor', ext.vendor || '—');
-    addRow('Total', ext.total || '—');
-    addRow('Tax', ext.tax || '—');
-    addRow('Category', ext.category || '—');
-    addRow('Invoice #', ext.invoice_number || '—');
+    addEditRow('Vendor', ext.vendor, 'vendor');
+    addEditRow('Total', ext.total, 'total', 'number');
+    addEditRow('Date', ext.date, 'date');
 
-    const dupCell = addRow('Duplicate', ext.flag_duplicate ? '⚠ YES' : 'No');
-    if (ext.flag_duplicate) dupCell.classList.add('flag-duplicate');
+    const catSelect = addEditRow('Category', ext.category, 'category', 'select');
+    const categories = ['Food & Beverage', 'Office Supplies', 'Travel', 'Fuel', 'Utilities', 'Medical', 'Equipment', 'Services', 'Miscellaneous', 'Invalid'];
+    categories.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c;
+      opt.textContent = c;
+      if (ext.category === c) opt.selected = true;
+      catSelect.appendChild(opt);
+    });
 
-    // Confidence row with progress bar
-    const confTr = document.createElement('tr');
-    const confLabel = document.createElement('td');
-    confLabel.textContent = 'Confidence';
-    const confValue = document.createElement('td');
-    confValue.textContent = `${conf}%`;
+    const btnSave = document.createElement('button');
+    btnSave.className = 'btn-save';
+    btnSave.textContent = 'Save Changes';
+    btnSave.onclick = () => saveReceiptData(id);
+    form.appendChild(btnSave);
 
-    const barWrap = document.createElement('div');
-    barWrap.className = 'confidence-bar';
-    const barFill = document.createElement('div');
-    barFill.className = 'confidence-fill';
-    barFill.style.width = `${Math.min(Math.max(conf, 0), 100)}%`;
-    barFill.style.background = confColor;
-    barWrap.appendChild(barFill);
-    confValue.appendChild(barWrap);
+    $modalData.appendChild(form);
 
-    confTr.appendChild(confLabel);
-    confTr.appendChild(confValue);
-    table.appendChild(confTr);
+    // Confidence display
+    const confP = document.createElement('p');
+    confP.style.fontSize = '12px';
+    confP.style.marginTop = '10px';
+    confP.style.color = 'var(--text-secondary)';
+    confP.textContent = `AI Confidence: ${conf}%`;
+    $modalData.appendChild(confP);
 
-    $modalData.appendChild(table);
   } else {
     const p = document.createElement('p');
     p.className = 'modal-placeholder';
     p.textContent = 'AI extraction pending…';
     $modalData.appendChild(p);
+  }
+}
+
+async function saveReceiptData(id) {
+  const vendor = document.getElementById('edit-vendor').value;
+  const total = parseFloat(document.getElementById('edit-total').value);
+  const date = document.getElementById('edit-date').value;
+  const category = document.getElementById('edit-category').value;
+
+  try {
+    const ref = db.collection('batches').doc(batchId)
+      .collection('receipts').doc(id);
+
+    const snap = await ref.get();
+    const currentData = snap.data() || {};
+    const extData = currentData.extractedData || {};
+
+    await ref.update({
+      "extractedData.vendor": vendor,
+      "extractedData.total": total,
+      "extractedData.date": date,
+      "extractedData.category": category,
+      "manualCorrection": true
+    });
+
+    showToast('Data updated', 'success');
+  } catch (err) {
+    showToast('Update failed: ' + err.message, 'error');
   }
 }
 
@@ -733,6 +871,77 @@ $btnFinish.addEventListener('click', async () => {
   }
 });
 
+// Added: Past Batches Placeholder
+// Batch History implementation
+if ($btnHistory) {
+  $btnHistory.addEventListener('click', showHistory);
+}
+
+async function showHistory() {
+  const historyOverlay = document.createElement('div');
+  historyOverlay.className = 'history-overlay active';
+  historyOverlay.innerHTML = `
+    <div class="history-content">
+      <div class="history-header">
+        <h2>Past Sessions</h2>
+        <button id="btn-close-history"><span class="material-symbols-rounded">close</span></button>
+      </div>
+      <div id="history-list" class="history-list">
+        <p class="loading">Loading batches…</p>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(historyOverlay);
+
+  document.getElementById('btn-close-history').onclick = () => historyOverlay.remove();
+
+  try {
+    const snap = await db.collection('batches')
+      .where('ownerId', '==', currentUser.uid)
+      .orderBy('createdAt', 'desc')
+      .limit(20)
+      .get();
+
+    const list = document.getElementById('history-list');
+    list.innerHTML = '';
+
+    if (snap.empty) {
+      list.innerHTML = '<p class="empty">No past sessions found.</p>';
+      return;
+    }
+
+    snap.forEach(doc => {
+      const b = doc.data();
+      const date = b.createdAt ? b.createdAt.toDate().toLocaleDateString() : 'Unknown';
+      const item = document.createElement('div');
+      item.className = 'history-item';
+      item.innerHTML = `
+        <div class="info">
+          <strong>${b.clientName || 'Unnamed'}</strong>
+          <span>${b.auditCycle || ''} • ${date}</span>
+        </div>
+        <button class="btn-restore">Restore</button>
+      `;
+      item.querySelector('.btn-restore').onclick = async () => {
+        const sure = confirm('Restore this past session?');
+        if (!sure) return;
+
+        clientName = b.clientName;
+        batchId = doc.id;
+        saveSession();
+        historyOverlay.remove();
+
+        // Full refresh to clean state
+        window.location.reload();
+      };
+      list.appendChild(item);
+    });
+  } catch (err) {
+    console.error(err);
+    document.getElementById('history-list').innerHTML = `<p class="error">Error: ${err.message}</p>`;
+  }
+}
+
 // ────────────────────────────────────────────────────────
 // 13. Export Excel
 // ────────────────────────────────────────────────────────
@@ -771,36 +980,82 @@ $btnExport.addEventListener('click', async () => {
 // 14. Back / End Session
 // ────────────────────────────────────────────────────────
 $btnBack.addEventListener('click', () => {
-  const sure = confirm('Leave this session? Your local data is safe and will restore automatically.');
-  if (!sure) return;
-  stopCamera();
-  // Don't clear session — "lunch break" will restore it
-  showScreen($setup);
+  resetApp();
 });
 
 // ────────────────────────────────────────────────────────
-// 15. Anonymous Authentication
+// 15. Professional Authentication (Email/Password)
 // ────────────────────────────────────────────────────────
+const $authScreen = document.getElementById('screen-auth');
+const $formLogin = document.getElementById('form-login');
+const $formSignup = document.getElementById('form-signup');
+const $linkShowSignup = document.getElementById('link-show-signup');
+const $linkShowLogin = document.getElementById('link-show-login');
+const $userProfile = document.getElementById('user-profile');
+const $userDisplayEmail = document.getElementById('user-display-email');
+const $btnLogout = document.getElementById('btn-logout');
+
+// Switch between Login and Signup forms
+$linkShowSignup.onclick = (e) => {
+  e.preventDefault();
+  $formLogin.style.display = 'none';
+  $formSignup.style.display = 'block';
+};
+
+$linkShowLogin.onclick = (e) => {
+  e.preventDefault();
+  $formSignup.style.display = 'none';
+  $formLogin.style.display = 'block';
+};
+
+// Login submission
+$formLogin.onsubmit = async (e) => {
+  e.preventDefault();
+  const email = document.getElementById('login-email').value;
+  const pass = document.getElementById('login-pass').value;
+  try {
+    await auth.signInWithEmailAndPassword(email, pass);
+    showToast('Signed in successfully', 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+};
+
+// Signup submission
+$formSignup.onsubmit = async (e) => {
+  e.preventDefault();
+  const email = document.getElementById('signup-email').value;
+  const pass = document.getElementById('signup-pass').value;
+  try {
+    const cred = await auth.createUserWithEmailAndPassword(email, pass);
+    showToast('Account created!', 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+};
+
+// Logout
+$btnLogout.onclick = async () => {
+  if (confirm('Sign out?')) {
+    await auth.signOut();
+    window.location.reload();
+  }
+};
+
 async function ensureAuth() {
-  return new Promise((resolve, reject) => {
-    // Listen for auth state changes
+  return new Promise((resolve) => {
     auth.onAuthStateChanged(async (user) => {
       if (user) {
         currentUser = user;
-        console.log('[Auth] Signed in:', user.uid);
+        $userProfile.style.display = 'flex';
+        $userDisplayEmail.textContent = user.email;
+        showScreen($setup);
         resolve(user);
       } else {
-        // No user — sign in anonymously
-        try {
-          const cred = await auth.signInAnonymously();
-          currentUser = cred.user;
-          console.log('[Auth] Anonymous sign-in:', cred.user.uid);
-          resolve(cred.user);
-        } catch (err) {
-          console.error('[Auth] Anonymous sign-in failed:', err);
-          showToast('Authentication failed', 'error');
-          reject(err);
-        }
+        currentUser = null;
+        $userProfile.style.display = 'none';
+        showScreen($authScreen);
+        // We don't resolve yet — wait for user to log in/sign up
       }
     });
   });
@@ -810,6 +1065,14 @@ async function ensureAuth() {
 // 16. Init
 // ────────────────────────────────────────────────────────
 (async function init() {
+  // Existing init code...
+
+  initTheme();
+
+  if ($btnResetSession) {
+    $btnResetSession.addEventListener('click', resetApp);
+  }
+
   // Show empty queue message
   const emptyMsg = document.createElement('span');
   emptyMsg.className = 'queue-empty';

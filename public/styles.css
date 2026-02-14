@@ -147,6 +147,49 @@ input {
   text-transform: uppercase;
 }
 
+.auth-switch {
+  margin-top: 20px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--text-secondary);
+}
+
+.auth-switch a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.user-profile {
+  margin-top: 10px;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid var(--border);
+}
+
+.user-profile span {
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 150px;
+}
+
+.btn-logout {
+  background: transparent;
+  border: none;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
 .input-group {
   margin-bottom: 20px;
   text-align: left;
@@ -401,6 +444,54 @@ input {
   color: var(--ai-sparkle);
 }
 
+/* Delete Button on Card */
+.btn-card-del {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #ff4d4d;
+  color: #fff;
+  border: 2px solid #fff;
+  /* High contrast border */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 10;
+  transition: transform 0.2s, background 0.2s;
+  padding: 0;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
+  /* More professional shadow */
+}
+
+/* Ensure icons don't block clicks */
+.btn-card-del span {
+  pointer-events: none;
+}
+
+.btn-card-del:hover {
+  transform: scale(1.15);
+  background: #ff0000;
+}
+
+/* Touch devices: always show delete button */
+@media (hover: none) {
+  .btn-card-del {
+    opacity: 1;
+  }
+}
+
+.q-card:hover .btn-card-del {
+  opacity: 1;
+}
+
+.btn-card-del .material-symbols-rounded {
+  font-size: 18px;
+}
+
 /* Scan Overlay Corners */
 .scan-overlay {
   position: absolute;
@@ -533,13 +624,31 @@ input {
   flex: 0 0 64px;
   width: 64px;
   height: 64px;
-  border-radius: var(--radius-sm);
-  overflow: hidden;
   position: relative;
   cursor: pointer;
+  /* overflow: visible to allow the delete button to float */
+}
+
+.q-card-inner {
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
   border: 2.5px solid var(--accent);
-  /* Default: BLUE — local */
   transition: border-color .3s, box-shadow .3s;
+  position: relative;
+}
+
+.q-card.uploading .q-card-inner {
+  border-color: var(--warning);
+}
+
+.q-card.synced .q-card-inner {
+  border-color: var(--success);
+}
+
+.q-card.extracted .q-card-inner {
+  border-color: var(--ai-sparkle);
 }
 
 .q-card img {
@@ -891,4 +1000,126 @@ input {
   width: 0%;
   transition: width 0.2s linear;
   z-index: 2;
+}
+
+/* ── Correction Form ──────────────────────────────── */
+.edit-form {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field-row label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.field-row input,
+.field-row select {
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 14px;
+}
+
+.btn-save {
+  margin-top: 10px;
+  padding: 12px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+}
+
+/* ── History Overlay ──────────────────────────────── */
+.history-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  backdrop-filter: blur(10px);
+  z-index: 2000;
+  display: flex;
+  align-items: flex-end;
+  /* Mobile-first bottom sheet style */
+}
+
+.history-content {
+  width: 100%;
+  max-width: 500px;
+  background: var(--bg-primary);
+  border-radius: 24px 24px 0 0;
+  margin: 0 auto;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  animation: slideUp 0.3s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(100%);
+  }
+
+  to {
+    transform: translateY(0);
+  }
+}
+
+.history-header {
+  padding: 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.history-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-item .info {
+  display: flex;
+  flex-direction: column;
+}
+
+.history-item .info strong {
+  color: var(--text-primary);
+}
+
+.history-item .info span {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.btn-restore {
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-weight: 600;
+  cursor: pointer;
 }
