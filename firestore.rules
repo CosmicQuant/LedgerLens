@@ -35,14 +35,14 @@ service cloud.firestore {
       // CREATE: Must be auth'd, must set ownerId to own UID
       allow create: if ownerIsCallerOnCreate();
 
-      // READ: Only the owner
+      // READ: Only the owner.
       allow read: if isOwner();
 
       // UPDATE: Only the owner, cannot change ownerId/createdAt
       allow update: if isOwner() && immutableFields();
 
-      // DELETE: Denied from client
-      allow delete: if false;
+      // DELETE: Only the owner
+      allow delete: if isOwner();
 
       // ════════════════════════════════════════════════════
       // Receipt Sub-collection: /batches/{batchId}/receipts/{receiptId}

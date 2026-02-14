@@ -59,6 +59,7 @@ let mediaStream = null;
 window.isUploading = false;
 window.uploadTimer = null;         // Explicit global scope for sync variable
 window.uploadRetryDelay = 15000;    // Exponential backoff delay for sync
+let extractionUnsubscribe = null;
 
 // PERFORMANCE CRITICAL: Single reusable canvas for all snaps
 const captureCanvas = document.createElement('canvas');
@@ -97,6 +98,8 @@ const $modalClose = document.querySelector('.modal-close-btn');
 const $btnTorch = document.getElementById('btn-torch');
 const $btnTheme = document.getElementById('btn-theme-toggle');
 const $btnResetSession = document.getElementById('btn-reset-session');
+const $btnGallery = document.getElementById('btn-gallery');
+const $inputBulk = document.getElementById('input-bulk');
 
 
 
@@ -148,7 +151,7 @@ function showScreen(screenEl) {
 }
 
 function initTheme() {
-  const savedTheme = localStorage.getItem('theme') || 'dark';
+  const savedTheme = localStorage.getItem('theme') || 'light';
   document.documentElement.setAttribute('data-theme', savedTheme);
 
   if ($btnTheme) {
@@ -172,16 +175,23 @@ function fireFlash() {
 // ────────────────────────────────────────────────────────
 // 4. Session Persistence — "Lunch Break" Logic
 // ────────────────────────────────────────────────────────
-function saveSession() {
-  localStorage.setItem('ll_client', clientName);
-  localStorage.setItem('ll_batch', batchId);
+/** Save local session state */
+function saveSession(status = 'active') {
+  localStorage.setItem('ll_batch', JSON.stringify({
+    clientName,
+    batchId,
+    status
+  }));
 }
 
 function clearSession() {
-  localStorage.removeItem('ll_client');
   localStorage.removeItem('ll_batch');
   clientName = '';
   batchId = '';
+  if (extractionUnsubscribe) {
+    extractionUnsubscribe();
+    extractionUnsubscribe = null;
+  }
 }
 
 async function resetApp() {
@@ -194,33 +204,56 @@ async function resetApp() {
   $snapCount.textContent = '0';
   $queueList.innerHTML = '<span class="queue-empty">Snap a receipt to begin</span>';
   if ($btnResetSession) $btnResetSession.style.display = 'none';
+  $btnExport.style.display = 'none';
+  $btnFinish.style.display = 'flex';
+  $btnFinish.disabled = true;
+
+  // Clear setup inputs
+  $inputClient.value = '';
+  $inputCycle.value = '';
 
   stopCamera();
   showScreen($setup);
 }
 
 async function tryRestoreSession() {
-  const savedClient = localStorage.getItem('ll_client');
-  const savedBatch = localStorage.getItem('ll_batch');
-  if (savedClient && savedBatch) {
-    clientName = savedClient;
-    batchId = savedBatch;
+  const raw = localStorage.getItem('ll_batch');
+  if (!raw) return false;
+
+  try {
+    const saved = JSON.parse(raw);
+    if (!saved || !saved.batchId) return false;
+
+    clientName = saved.clientName;
+    batchId = saved.batchId;
+
     $lblClient.textContent = clientName;
     $lblBatch.textContent = `Batch ${batchId.slice(0, 8)}…`;
+
     showScreen($camera);
     await startCamera();
     await restoreQueueFromFirestore();
+    await restoreQueueFromIDB(saved);
 
-    // Check queue from IDB
-    await restoreQueueFromIDB();
+    // UI State based on status
+    if (saved.status === 'completed') {
+      $btnFinish.style.display = 'none';
+      $btnExport.style.display = 'flex';
+    } else {
+      $btnFinish.style.display = 'flex';
+      $btnExport.style.display = 'none';
+      updateFinishButton();
+    }
 
-    // Start upload loop with backoff
     scheduleUpload(5000);
     showToast('Session restored ✓', 'success');
     if ($btnResetSession) $btnResetSession.style.display = 'flex';
+
     return true;
+  } catch (e) {
+    console.warn('Malformed session data:', e);
+    return false;
   }
-  return false;
 }
 
 // Repopulate queue from Firestore for already-synced receipts
@@ -247,7 +280,7 @@ async function restoreQueueFromFirestore() {
 }
 
 // Repopulate queue from IDB for un-synced local receipts
-async function restoreQueueFromIDB() {
+async function restoreQueueFromIDB(savedSession) {
   const database = await getIDB();
   const all = await database.getAllFromIndex(STORE_NAME, 'batchId', batchId);
   for (const rec of all) {
@@ -260,7 +293,17 @@ async function restoreQueueFromIDB() {
     if (rec.status === 'pending_upload' || rec.status === 'uploading') pendingCount++;
   }
   $snapCount.textContent = snapCounter;
-  updateFinishButton();
+
+  // If restored batch was already completed, switch to export view
+  const status = savedSession ? savedSession.status : 'active';
+  if (status === 'completed') {
+    $btnFinish.style.display = 'none';
+    $btnExport.style.display = 'flex';
+  } else {
+    $btnFinish.style.display = 'flex';
+    $btnExport.style.display = 'none';
+    updateFinishButton();
+  }
   // Kick off upload for any pending
   uploadPending();
 }
@@ -287,6 +330,9 @@ $formSetup.addEventListener('submit', async (e) => {
   snapCounter = 0;
   pendingCount = 0;
   $snapCount.textContent = '0';
+  $btnExport.style.display = 'none';
+  $btnFinish.style.display = 'flex';
+  $btnFinish.disabled = true;
 
   // Create batch document in Firestore with ownerId for access control
   try {
@@ -295,7 +341,8 @@ $formSetup.addEventListener('submit', async (e) => {
       auditCycle: cycle,
       ownerId: currentUser.uid,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-      status: 'active'
+      status: 'active',
+      receiptCount: 0
     });
   } catch (err) {
     console.warn('Firestore batch create deferred (offline):', err);
@@ -428,6 +475,53 @@ $btnSnap.addEventListener('click', async () => {
   uploadPending();
 });
 
+// ── BATCH UPLOAD: Gallery / File Picker ───────────────
+$btnGallery.addEventListener('click', () => {
+  $inputBulk.click();
+});
+
+$inputBulk.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files);
+  if (!files.length) return;
+
+  $inputBulk.value = ''; // Reset for next selection
+  handleBulkUpload(files);
+});
+
+async function handleBulkUpload(files) {
+  showToast(`Processing ${files.length} images…`, 'info');
+
+  for (const file of files) {
+    if (snapCounter >= BATCH_MAX_IMAGES) {
+      showToast('Batch limit reached', 'error');
+      break;
+    }
+
+    const receiptId = uid();
+    snapCounter++;
+    pendingCount++;
+    $snapCount.textContent = snapCounter;
+
+    // Save to IDB
+    const database = await getIDB();
+    await database.put(STORE_NAME, {
+      id: receiptId,
+      batchId: batchId,
+      blob: file,
+      status: 'pending_upload',
+      createdAt: Date.now()
+    });
+
+    // Add to UI
+    const thumbUrl = URL.createObjectURL(file);
+    activeObjectURLs.set(receiptId, thumbUrl);
+    addThumbnailToQueue(receiptId, thumbUrl, 'pending_upload', null);
+  }
+
+  updateFinishButton();
+  uploadPending();
+}
+
 // ────────────────────────────────────────────────────────
 // 8. Reactive Queue UI
 // ────────────────────────────────────────────────────────
@@ -472,6 +566,27 @@ function addThumbnailToQueue(id, thumbUrl, status, firestoreData) {
   iconSparkle.className = 'material-symbols-rounded status-icon icon-sparkle';
   iconSparkle.textContent = 'auto_awesome';
   inner.appendChild(iconSparkle);
+
+  const badgeInvalid = document.createElement('div');
+  badgeInvalid.className = 'badge-invalid';
+  badgeInvalid.textContent = 'Invalid';
+  inner.appendChild(badgeInvalid);
+
+  // Processing Badge
+  const badgeProc = document.createElement('div');
+  badgeProc.className = 'badge-proc';
+  badgeProc.textContent = 'AI Processing...';
+  inner.appendChild(badgeProc);
+
+  // Initial Visibility
+  if (status === 'synced' || status === 'uploaded') {
+    div.classList.add('is-processing');
+  }
+
+  // Check for Invalid state
+  if (firestoreData && firestoreData.extractedData && firestoreData.extractedData.category === 'Invalid') {
+    div.classList.add('is-invalid');
+  }
 
   // Delete Button
   const btnDel = document.createElement('button');
@@ -534,6 +649,19 @@ function updateThumbnailStatus(id, status, firestoreData) {
   if (!card) return;
   applyCardState(card, status);
   if (firestoreData) card._firestoreData = firestoreData;
+
+  // Toggle processing badge
+  if (status === 'synced' || status === 'uploaded' || status === 'uploading') {
+    card.classList.add('is-processing');
+  } else {
+    card.classList.remove('is-processing');
+  }
+
+  // Handle Invalid state override
+  if (firestoreData && firestoreData.extractedData && firestoreData.extractedData.category === 'Invalid') {
+    card.classList.add('is-invalid');
+    card.classList.remove('is-processing');
+  }
 }
 
 function applyCardState(card, status) {
@@ -555,8 +683,8 @@ function applyCardState(card, status) {
 }
 
 function updateFinishButton() {
-  // Uses in-memory pendingCount (reliable even after Delete-on-Success clears IDB)
-  $btnFinish.disabled = pendingCount > 0;
+  // Only enable if there's at least one receipt and no active uploads
+  $btnFinish.disabled = (snapCounter === 0 || pendingCount > 0);
 }
 
 // ────────────────────────────────────────────────────────
@@ -677,19 +805,29 @@ setInterval(() => {
 // 10. Firestore Listener — AI Extraction Updates
 // ────────────────────────────────────────────────────────
 function startExtractionListener() {
-  if (!batchId) return;
-  db.collection('batches').doc(batchId)
+  if (!batchId || !currentUser) return;
+
+  // Stop existing listener if any
+  if (extractionUnsubscribe) {
+    extractionUnsubscribe();
+    extractionUnsubscribe = null;
+  }
+
+  extractionUnsubscribe = db.collection('batches').doc(batchId)
     .collection('receipts')
     .where('extracted', '==', true)
     .onSnapshot(snapshot => {
+      // ... same logic ...
       snapshot.docChanges().forEach(change => {
         if (change.type === 'added' || change.type === 'modified') {
           const data = change.doc.data();
           updateThumbnailStatus(change.doc.id, 'extracted', data);
-          // IDB record already deleted by Delete-on-Success — no update needed.
         }
       });
-    }, err => console.warn('Snapshot listener error:', err));
+    }, err => {
+      if (err.code === 'permission-denied') return; // Silence permission errors on session transitions
+      console.warn('Snapshot listener error:', err);
+    });
 }
 
 // ────────────────────────────────────────────────────────
@@ -862,6 +1000,7 @@ $btnFinish.addEventListener('click', async () => {
       completedAt: firebase.firestore.FieldValue.serverTimestamp(),
       totalReceipts: snapCounter
     });
+    saveSession('completed'); // Sync local status
     showToast('Batch completed ✓', 'success');
     $btnFinish.style.display = 'none';
     $btnExport.style.display = 'flex';
@@ -875,6 +1014,39 @@ $btnFinish.addEventListener('click', async () => {
 // Batch History implementation
 if ($btnHistory) {
   $btnHistory.addEventListener('click', showHistory);
+}
+
+async function deleteBatch(id, name) {
+  const sure = confirm(`Permanently delete batch "${name || id}" and all its receipts?`);
+  if (!sure) return;
+
+  try {
+    showToast('Deleting batch...', 'info');
+
+    // 1. Delete all images from Storage for this batch
+    try {
+      const storageRef = storage.ref(`receipts/${id}`);
+      const listResult = await storageRef.listAll();
+      const storageDeletions = listResult.items.map(item => item.delete());
+      await Promise.all(storageDeletions);
+    } catch (sErr) {
+      console.warn('Storage deletion warning (some files may remain):', sErr);
+    }
+
+    // 2. Delete all receipts in subcollection (Firestore basic delete doesn't do subcollections automatically)
+    const receipts = await db.collection('batches').doc(id).collection('receipts').get();
+    const batch = db.batch();
+    receipts.forEach(r => batch.delete(r.ref));
+
+    // 3. Delete the batch document itself
+    batch.delete(db.collection('batches').doc(id));
+
+    await batch.commit();
+    showToast('Batch and images deleted ✓', 'success');
+  } catch (err) {
+    console.error('[Delete] failed:', err);
+    showToast('Delete failed: ' + err.message, 'error');
+  }
 }
 
 async function showHistory() {
@@ -915,25 +1087,50 @@ async function showHistory() {
       const date = b.createdAt ? b.createdAt.toDate().toLocaleDateString() : 'Unknown';
       const item = document.createElement('div');
       item.className = 'history-item';
+
+      const countElId = `hist-count-${doc.id}`;
       item.innerHTML = `
         <div class="info">
           <strong>${b.clientName || 'Unnamed'}</strong>
-          <span>${b.auditCycle || ''} • ${date}</span>
+          <span>${b.auditCycle || ''} • ${date} • <span id="${countElId}">${b.receiptCount || '—'}</span> receipts</span>
         </div>
-        <button class="btn-restore">Restore</button>
+        <div class="actions">
+          <button class="btn-restore">Restore</button>
+          <button class="btn-batch-del" title="Delete Batch">
+            <span class="material-symbols-rounded">delete</span>
+          </button>
+        </div>
       `;
+
+      // Fallback: If count is 0, query the sub-collection to double check
+      if (!b.receiptCount) {
+        db.collection('batches').doc(doc.id).collection('receipts').get().then(rSnap => {
+          const countEl = document.getElementById(countElId);
+          if (countEl && rSnap.size > 0) {
+            countEl.textContent = rSnap.size;
+          }
+        }).catch(() => { });
+      }
       item.querySelector('.btn-restore').onclick = async () => {
         const sure = confirm('Restore this past session?');
         if (!sure) return;
 
         clientName = b.clientName;
         batchId = doc.id;
-        saveSession();
-        historyOverlay.remove();
+        // Save with the status from the database
+        saveSession(b.status || 'active');
 
-        // Full refresh to clean state
+        // Full refresh to clean state and let tryRestoreSession take over
         window.location.reload();
       };
+
+      item.querySelector('.btn-batch-del').onclick = async (e) => {
+        e.stopPropagation();
+        await deleteBatch(doc.id, b.clientName);
+        historyOverlay.remove();
+        showHistory(); // Re-open history to see updated list
+      };
+
       list.appendChild(item);
     });
   } catch (err) {
@@ -951,19 +1148,22 @@ $btnExport.addEventListener('click', async () => {
     // Get the current user's ID token for authenticated request
     const idToken = await currentUser.getIdToken(true);
 
-    // Call the Cloud Function export endpoint with auth
-    const resp = await fetch(
-      `https://us-central1-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/export_batch`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${idToken}`
-        },
-        body: JSON.stringify({ batch_id: batchId })
-      }
-    );
-    const result = await resp.json();
+    // Call the Cloud Function export endpoint via proxy (same-origin)
+    const response = await fetch('/api/export', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${idToken}`
+      },
+      body: JSON.stringify({ batch_id: batchId })
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.error || `Export failed (Status ${response.status})`);
+    }
+
+    const result = await response.json();
     if (result.download_url) {
       window.open(result.download_url, '_blank');
       showToast('Excel report ready!', 'success');
@@ -984,52 +1184,22 @@ $btnBack.addEventListener('click', () => {
 });
 
 // ────────────────────────────────────────────────────────
-// 15. Professional Authentication (Email/Password)
+// 15. Professional Authentication (Google Auth)
 // ────────────────────────────────────────────────────────
 const $authScreen = document.getElementById('screen-auth');
-const $formLogin = document.getElementById('form-login');
-const $formSignup = document.getElementById('form-signup');
-const $linkShowSignup = document.getElementById('link-show-signup');
-const $linkShowLogin = document.getElementById('link-show-login');
+const $btnGoogleLogin = document.getElementById('btn-google-login');
 const $userProfile = document.getElementById('user-profile');
 const $userDisplayEmail = document.getElementById('user-display-email');
 const $btnLogout = document.getElementById('btn-logout');
 
-// Switch between Login and Signup forms
-$linkShowSignup.onclick = (e) => {
-  e.preventDefault();
-  $formLogin.style.display = 'none';
-  $formSignup.style.display = 'block';
-};
-
-$linkShowLogin.onclick = (e) => {
-  e.preventDefault();
-  $formSignup.style.display = 'none';
-  $formLogin.style.display = 'block';
-};
-
-// Login submission
-$formLogin.onsubmit = async (e) => {
-  e.preventDefault();
-  const email = document.getElementById('login-email').value;
-  const pass = document.getElementById('login-pass').value;
+// Google Login
+$btnGoogleLogin.onclick = async () => {
+  const provider = new firebase.auth.GoogleAuthProvider();
   try {
-    await auth.signInWithEmailAndPassword(email, pass);
-    showToast('Signed in successfully', 'success');
+    await auth.signInWithPopup(provider);
+    showToast('Signed in with Google', 'success');
   } catch (err) {
-    showToast(err.message, 'error');
-  }
-};
-
-// Signup submission
-$formSignup.onsubmit = async (e) => {
-  e.preventDefault();
-  const email = document.getElementById('signup-email').value;
-  const pass = document.getElementById('signup-pass').value;
-  try {
-    const cred = await auth.createUserWithEmailAndPassword(email, pass);
-    showToast('Account created!', 'success');
-  } catch (err) {
+    console.error('[Auth] Google sign-in failed:', err);
     showToast(err.message, 'error');
   }
 };
@@ -1048,14 +1218,14 @@ async function ensureAuth() {
       if (user) {
         currentUser = user;
         $userProfile.style.display = 'flex';
-        $userDisplayEmail.textContent = user.email;
+        $userDisplayEmail.textContent = user.email || user.displayName;
         showScreen($setup);
         resolve(user);
       } else {
         currentUser = null;
         $userProfile.style.display = 'none';
         showScreen($authScreen);
-        // We don't resolve yet — wait for user to log in/sign up
+        // We don't resolve — enforcing the login screen
       }
     });
   });

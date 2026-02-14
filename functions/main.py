@@ -99,6 +99,14 @@ def extract_receipt_data(image_bytes: bytes) -> dict:
                 raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
                 raw_text = re.sub(r"\s*```$", "", raw_text)
 
+            # Robust JSON extraction
+            json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+            if json_match:
+                raw_text = json_match.group(0)
+            
+            # Final attempt to clean trailing commas or weirdness
+            raw_text = re.sub(r",\s*\}", "}", raw_text)
+
             data = json.loads(raw_text)
 
             # Validate / enforce schema
@@ -147,6 +155,12 @@ def _fallback_data(confidence: int) -> dict:
     }
 
 
+def compute_receipt_hash(data: dict) -> str:
+    """Generate a simple deterministic hash for duplicate detection."""
+    raw = f"{data.get('vendor')}|{data.get('total')}|{data.get('date')}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
 # ────────────────────────────────────────────────────────
 # Cloud Function — Storage Trigger
 # ────────────────────────────────────────────────────────
@@ -160,68 +174,74 @@ def _fallback_data(confidence: int) -> dict:
 def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]):
     """
     Triggered when a receipt image is uploaded to Firebase Storage.
-    Expected path: receipts/{batch_id}/{receipt_id}.jpg
     """
-    if not firebase_admin._apps:
-        initialize_app()
-    db = firestore.client()
-    storage_client = storage.bucket(event.data.bucket)
+    try:
+        if not firebase_admin._apps:
+            initialize_app()
+        db = firestore.client()
+        
+        file_path = event.data.name
+        bucket_name = event.data.bucket
 
-    file_path = event.data.name
-    bucket_name = event.data.bucket # This variable is now redundant as storage_client is used directly
+        # Guard: only process receipt images
+        if not file_path or not file_path.startswith("receipts/"):
+            return
+        if not file_path.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            return
 
-    # Guard: only process receipt images
-    if not file_path or not file_path.startswith("receipts/"):
-        print(f"[Skip] Not a receipt path: {file_path}")
-        return
-    if not file_path.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-        print(f"[Skip] Not an image: {file_path}")
-        return
+        # Parse batch_id and receipt_id from path
+        parts = file_path.split("/")
+        if len(parts) < 3: return
 
-    # Parse batch_id and receipt_id from path
-    parts = file_path.split("/")
-    if len(parts) < 3:
-        print(f"[Skip] Unexpected path structure: {file_path}")
-        return
+        batch_id = parts[1]
+        receipt_id = parts[2].rsplit(".", 1)[0]
 
-    batch_id = parts[1]
-    receipt_id = parts[2].rsplit(".", 1)[0]  # Remove extension
+        print(f"[Process] batch={batch_id} receipt={receipt_id} bucket={bucket_name}")
 
-    print(f"[Process] batch={batch_id} receipt={receipt_id}")
+        # Download the image
+        bucket = storage.bucket(bucket_name)
+        blob = bucket.blob(file_path)
+        image_bytes = blob.download_as_bytes()
 
-    # Download the image
-    bucket = storage.bucket(bucket_name)
-    blob = bucket.blob(file_path)
-    image_bytes = blob.download_as_bytes()
+        # Extract data via Gemini
+        extracted = extract_receipt_data(image_bytes)
 
-    # Extract data via Gemini
-    extracted = extract_receipt_data(image_bytes)
+        # Compute duplicate hash
+        receipt_hash = compute_receipt_hash(extracted)
 
-    # Compute duplicate hash
-    receipt_hash = compute_receipt_hash(extracted)
+        # Check for duplicates within this batch - Wrap in TRY to prevent 403/Index crashes
+        is_duplicate = False
+        try:
+            batch_ref = db.collection("batches").document(batch_id).collection("receipts")
+            existing_query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
+            for doc in existing_query:
+                if doc.id != receipt_id:
+                    is_duplicate = True
+                    break
+        except Exception as q_err:
+            print(f"[Warning] Duplicate check failed: {q_err}")
+            
+        extracted["flag_duplicate"] = is_duplicate
 
-    # Check for duplicates within this batch
-    batch_ref = db.collection("batches").document(batch_id).collection("receipts")
-    existing_query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
-    is_duplicate = False
-    for doc in existing_query:
-        if doc.id != receipt_id:
-            is_duplicate = True
-            break
+        # Update Firestore document
+        print(f"[Firestore] Updating receipt {receipt_id} in {batch_id}")
+        receipt_ref = batch_ref.document(receipt_id)
+        receipt_ref.set({
+            "extracted": True,
+            "extractedData": extracted,
+            "receipt_hash": receipt_hash,
+            "processedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
 
-    extracted["flag_duplicate"] = is_duplicate
+        # Increment receiptCount in the parent batch document
+        print(f"[Firestore] Incrementing count for batch {batch_id}")
+        db.collection("batches").document(batch_id).set({
+            "receiptCount": firestore.Increment(1)
+        }, merge=True)
 
-    # Update Firestore document
-    receipt_ref = batch_ref.document(receipt_id)
-    receipt_ref.update({
-        "extracted": True,
-        "extractedData": extracted,
-        "receipt_hash": receipt_hash,
-        "processedAt": firestore.SERVER_TIMESTAMP,
-    })
+        print(f"[Done] receipt={receipt_id} vendor={extracted.get('vendor')}")
 
-    print(
-        f"[Done] receipt={receipt_id} vendor={extracted['vendor']} "
-        f"total={extracted['total']} confidence={extracted['confidence_score']} "
-        f"duplicate={is_duplicate}"
-    )
+    except Exception as e:
+        print(f"[ERROR] on_receipt_upload failed for {event.data.name}: {str(e)}")
+        import traceback
+        traceback.print_exc()

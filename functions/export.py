@@ -7,6 +7,7 @@ using pandas + XlsxWriter, with permanent Firebase Storage download URLs.
 import io
 import os
 import uuid
+import json
 from datetime import datetime
 
 import firebase_admin
@@ -296,7 +297,7 @@ def verify_request_auth(req) -> dict:
     timeout_sec=300,
     max_instances=5,
     cors=options.CorsOptions(
-        cors_origins="*", # Use explicit wildcard for broad compatibility
+        cors_origins="*",
         cors_methods=["POST", "OPTIONS"],
     ),
 )
@@ -304,30 +305,17 @@ def export_batch(req: https_fn.Request) -> https_fn.Response:
     """
     HTTP Cloud Function to export a batch of receipts to an Excel file.
     """
-    # ── MANUAL PREFLIGHT OVERRIDE ───────────────────────
-    if req.method == "OPTIONS":
-        return https_fn.Response(
-            status=204,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-                "Access-Control-Max-Age": "3600",
-            },
-        )
     if not firebase_admin._apps:
         initialize_app()
     db = firestore.client()
 
-    # ── SECURITY: Verify authentication ──────────────────
+    # ── SECURITY Check ────────────────────────────────
     try:
         decoded_token = verify_request_auth(req)
         caller_uid = decoded_token["uid"]
-        print(f"[Export] Authenticated request from uid={caller_uid}")
-    except (ValueError, Exception) as auth_err:
-        print(f"[Export] Auth rejected: {auth_err}")
+    except Exception as auth_err:
         return https_fn.Response(
-            json={"error": "Unauthorized. Please sign in."},
+            json={"error": "Unauthorized"},
             status=401,
         )
 
@@ -375,19 +363,25 @@ def export_batch(req: https_fn.Request) -> https_fn.Response:
         download_url = get_permanent_download_url(bucket.name, export_path, token)
 
         return https_fn.Response(
-            json={
+            response=json.dumps({
                 "download_url": download_url,
                 "filename": filename,
-            },
+            }),
             status=200,
+            mimetype="application/json"
         )
 
     except ValueError as e:
-        return https_fn.Response(json={"error": str(e)}, status=404)
+        return https_fn.Response(
+            response=json.dumps({"error": str(e)}),
+            status=404,
+            mimetype="application/json"
+        )
     except Exception as e:
         # SECURITY: Log real error server-side, return generic message to client
         print(f"[Export Error] {e}")
         return https_fn.Response(
-            json={"error": "An internal error occurred. Please try again."},
+            response=json.dumps({"error": "An internal error occurred. Please try again."}),
             status=500,
+            mimetype="application/json"
         )

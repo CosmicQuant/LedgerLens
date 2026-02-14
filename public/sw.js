@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ledgerlens-v1';
+const CACHE_NAME = 'ledgerlens-v7';
 const ASSETS = [
     '/',
     '/index.html',
@@ -17,8 +17,10 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('fetch', (event) => {
     // Network first for APIs, Cache first for assets
-    if (event.request.url.includes('firestore') || event.request.url.includes('googleapis')) {
-        return; // Let Firebase SDK handle its own networking/offline
+    if (event.request.url.includes('firestore') ||
+        event.request.url.includes('googleapis') ||
+        event.request.url.includes('cloudfunctions.net')) {
+        return; // Direct network for APIs
     }
 
     event.respondWith(
