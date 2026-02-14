@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+*.pyc
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.key
+*-service-account*.json
+*-credentials*.json
+
+# Firebase
+firebase-debug.log
+firebase-debug.*.log
+.firebase/
+.runtimeconfig.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

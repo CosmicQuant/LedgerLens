@@ -1,0 +1,9 @@
+# LedgerLens — Cloud Functions Dependencies
+# Python 3.11 Runtime
+
+firebase-admin>=6.5.0
+firebase-functions>=0.4.0
+google-generativeai>=0.7.0
+google-cloud-secret-manager>=2.20.0
+pandas>=2.2.0
+XlsxWriter>=3.2.0

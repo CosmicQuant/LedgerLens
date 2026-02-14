@@ -1,0 +1,837 @@
+/* ═══════════════════════════════════════════════════════
+   LedgerLens — app.js
+   Offline-first receipt processing PWA
+   ═══════════════════════════════════════════════════════ */
+
+// ────────────────────────────────────────────────────────
+// 0. Firebase Configuration
+//    Replace these with YOUR project values.
+// ────────────────────────────────────────────────────────
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDNZ7QAtXtNonffAtnVNkWPUe1kn2_Zhck",
+  authDomain: "ledgerlens-b4050.firebaseapp.com",
+  projectId: "ledgerlens-b4050",
+  storageBucket: "ledgerlens-b4050.firebasestorage.app",
+  messagingSenderId: "502864448807",
+  appId: "1:502864448807:web:9ddd1e9817ba49ba44ad02",
+  measurementId: "G-P78YWQBCDC"
+};
+
+firebase.initializeApp(FIREBASE_CONFIG);
+const db = firebase.firestore();
+const storage = firebase.storage();
+const auth = firebase.auth();
+
+// Current authenticated user (set after anonymous sign-in)
+let currentUser = null;
+
+// ────────────────────────────────────────────────────────
+// 1. IndexedDB (via idb)
+// ────────────────────────────────────────────────────────
+const IDB_NAME = 'ledgerlens-db';
+const IDB_VERSION = 1;
+const STORE_NAME = 'receipts';
+
+let idbInstance = null;
+
+async function getIDB() {
+  if (idbInstance) return idbInstance;
+  idbInstance = await idb.openDB(IDB_NAME, IDB_VERSION, {
+    upgrade(database) {
+      if (!database.objectStoreNames.contains(STORE_NAME)) {
+        const store = database.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        store.createIndex('status', 'status');
+        store.createIndex('batchId', 'batchId');
+      }
+    }
+  });
+  return idbInstance;
+}
+
+// ────────────────────────────────────────────────────────
+// 2. Globals
+// ────────────────────────────────────────────────────────
+let clientName = '';
+let batchId = '';
+let snapCounter = 0;
+let pendingCount = 0;          // tracks images still uploading
+let mediaStream = null;
+let isUploading = false;
+
+// PERFORMANCE CRITICAL: Single reusable canvas for all snaps
+const captureCanvas = document.createElement('canvas');
+const captureCtx = captureCanvas.getContext('2d');
+
+const MAX_WIDTH = 1500;
+const JPEG_QUALITY = 0.8;
+const BATCH_MAX_IMAGES = 500;
+
+const activeObjectURLs = new Map(); // id → objectURL
+
+// DOM references
+const $setup = document.getElementById('screen-setup');
+const $camera = document.getElementById('screen-camera');
+const $formSetup = document.getElementById('form-setup');
+const $inputClient = document.getElementById('client-name');
+const $inputCycle = document.getElementById('input-cycle');
+const $btnStart = document.getElementById('btn-start-batch');
+const $btnBack = document.getElementById('btn-back');
+const $lblClient = document.getElementById('lbl-client');
+const $lblBatch = document.getElementById('lbl-batch');
+const $snapCount = document.getElementById('snap-count');
+const $syncInd = document.getElementById('sync-indicator');
+const $video = document.getElementById('camera-feed');
+const $flashFx = document.getElementById('flash-fx');
+const $btnSnap = document.querySelector('.btn-shutter');
+const $queueList = document.querySelector('.queue-list');
+const $btnFinish = document.getElementById('btn-finish');
+const $btnExport = document.getElementById('btn-export');
+const $toastBox = document.getElementById('toast-container');
+const $modal = document.querySelector('.modal-overlay');
+const $modalImg = document.getElementById('modal-img');
+const $modalData = document.querySelector('.modal-data');
+const $modalClose = document.querySelector('.modal-close-btn');
+const $btnTorch = document.getElementById('btn-torch');
+const $btnTheme = document.getElementById('btn-theme-toggle');
+
+
+
+// ────────────────────────────────────────────────────────
+// 3. Utility Functions
+// ────────────────────────────────────────────────────────
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+/**
+ * Sanitize user input — strip characters that could cause
+ * injection in HTML, Firestore paths, or Storage paths.
+ */
+function sanitizeInput(str) {
+  return str
+    .replace(/[<>"'&\/\\]/g, '')   // Strip HTML/path-dangerous chars
+    .replace(/\.\.+/g, '.')         // Prevent directory traversal
+    .replace(/[\x00-\x1F]/g, '')   // Strip control characters
+    .trim()
+    .slice(0, 120);                 // Enforce max length
+}
+
+/**
+ * Escape text for safe display — used as a secondary guard
+ * even though we use textContent (not innerHTML) for AI data.
+ */
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function showToast(msg, type = 'info', duration = 3000) {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  $toastBox.appendChild(el);
+  setTimeout(() => {
+    el.style.transition = 'opacity .3s';
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 300);
+  }, duration);
+}
+
+function showScreen(screenEl) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  screenEl.classList.add('active');
+}
+
+function fireFlash() {
+  $flashFx.classList.remove('fire');
+  void $flashFx.offsetWidth; // reflow
+  $flashFx.classList.add('fire');
+}
+
+// ────────────────────────────────────────────────────────
+// 4. Session Persistence — "Lunch Break" Logic
+// ────────────────────────────────────────────────────────
+function saveSession() {
+  localStorage.setItem('ll_client', clientName);
+  localStorage.setItem('ll_batch', batchId);
+}
+
+function clearSession() {
+  localStorage.removeItem('ll_client');
+  localStorage.removeItem('ll_batch');
+}
+
+async function tryRestoreSession() {
+  const savedClient = localStorage.getItem('ll_client');
+  const savedBatch = localStorage.getItem('ll_batch');
+  if (savedClient && savedBatch) {
+    clientName = savedClient;
+    batchId = savedBatch;
+    $lblClient.textContent = clientName;
+    $lblBatch.textContent = `Batch ${batchId.slice(0, 8)}…`;
+    showScreen($camera);
+    await startCamera();
+    await restoreQueueFromFirestore();
+    // Theme Init
+    const savedTheme = localStorage.getItem('theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+
+    // Theme Toggle
+    $btnTheme.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme');
+      const next = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      $btnTheme.innerHTML = `<span class="material-symbols-rounded">${next === 'dark' ? 'dark_mode' : 'light_mode'}</span>`;
+    });
+
+    // Check queue from IDB
+    await restoreQueueFromIDB();
+
+    // Start upload loop with backoff
+    scheduleUpload(5000);
+    showToast('Session restored ✓', 'success');
+    return true;
+  }
+  return false;
+}
+
+// Repopulate queue from Firestore for already-synced receipts
+async function restoreQueueFromFirestore() {
+  try {
+    const snap = await db.collection('batches').doc(batchId)
+      .collection('receipts').get();
+    snap.forEach(docSnap => {
+      const d = docSnap.data();
+      const status = d.extracted ? 'extracted' : 'synced';
+      addThumbnailToQueue(docSnap.id, d.thumbUrl || d.storageUrl, status, d);
+      snapCounter++;
+    });
+    $snapCount.textContent = snapCounter;
+  } catch (err) {
+    console.warn('Firestore restore failed (offline?):', err);
+  }
+}
+
+// Repopulate queue from IDB for un-synced local receipts
+async function restoreQueueFromIDB() {
+  const database = await getIDB();
+  const all = await database.getAllFromIndex(STORE_NAME, 'batchId', batchId);
+  for (const rec of all) {
+    // Skip if already shown from Firestore
+    if (document.getElementById(`q-${rec.id}`)) continue;
+    const thumbUrl = URL.createObjectURL(rec.blob);
+    activeObjectURLs.set(rec.id, thumbUrl); // track for cleanup
+    addThumbnailToQueue(rec.id, thumbUrl, rec.status, null);
+    snapCounter++;
+    if (rec.status === 'pending_upload' || rec.status === 'uploading') pendingCount++;
+  }
+  $snapCount.textContent = snapCounter;
+  updateFinishButton();
+  // Kick off upload for any pending
+  uploadPending();
+}
+
+// ────────────────────────────────────────────────────────
+// 5. Setup Flow
+// ────────────────────────────────────────────────────────
+$formSetup.addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  // Sanitize inputs to prevent injection
+  clientName = sanitizeInput($inputClient.value);
+  const cycle = sanitizeInput($inputCycle.value);
+  if (!clientName || !cycle) {
+    showToast('Please enter valid names (no special characters)', 'error');
+    return;
+  }
+
+  batchId = `${clientName.replace(/\s+/g, '_')}_${cycle.replace(/\s+/g, '_')}_${uid()}`;
+  saveSession();
+
+  // Create batch document in Firestore with ownerId for access control
+  try {
+    await db.collection('batches').doc(batchId).set({
+      clientName,
+      auditCycle: cycle,
+      ownerId: currentUser.uid,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      status: 'active'
+    });
+  } catch (err) {
+    console.warn('Firestore batch create deferred (offline):', err);
+  }
+
+  $lblClient.textContent = clientName;
+  $lblBatch.textContent = `Batch ${batchId.slice(0, 8)}…`;
+  showScreen($camera);
+  await startCamera();
+  showToast(`Batch started for ${clientName}`, 'success');
+});
+
+// ────────────────────────────────────────────────────────
+// 6. Camera — Memory-Safe Loop
+// ────────────────────────────────────────────────────────
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'environment', // Rear camera
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    });
+
+    mediaStream = stream;
+    $video.srcObject = stream;
+
+    // Torch Capability Check
+    const track = stream.getVideoTracks()[0];
+    const capabilities = track.getCapabilities();
+    if (capabilities.torch) {
+      $btnTorch.classList.remove('hidden');
+      $btnTorch.onclick = () => {
+        isTorchOn = !isTorchOn;
+        track.applyConstraints({ advanced: [{ torch: isTorchOn }] });
+        $btnTorch.classList.toggle('active', isTorchOn);
+      };
+    }
+
+    try {
+      await $video.play();
+    } catch (err) {
+      console.error('Video play error:', err);
+    }
+  } catch (err) {
+    showToast('Camera access denied', 'error');
+    console.error('Camera error:', err);
+  }
+}
+
+function stopCamera() {
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(t => t.stop());
+    mediaStream = null;
+    $video.srcObject = null;
+  }
+}
+
+function captureFrame() {
+  if (!mediaStream) return null;
+
+  const track = mediaStream.getVideoTracks()[0];
+  const settings = track.getSettings();
+
+  const targetW = MAX_WIDTH;
+  const scale = targetW / settings.width;
+  const targetH = settings.height * scale;
+
+  // Reuse the SINGLE canvas — no DOM thrashing
+  captureCanvas.width = targetW;
+  captureCanvas.height = targetH;
+  captureCtx.drawImage($video, 0, 0, targetW, targetH);
+
+  return new Promise(resolve => {
+    // WebP Compression for smaller file size
+    captureCanvas.toBlob(blob => resolve(blob), 'image/webp', JPEG_QUALITY);
+  });
+}
+
+// ────────────────────────────────────────────────────────
+// 7. Snap Handler
+// ────────────────────────────────────────────────────────
+$btnSnap.addEventListener('click', async () => {
+  // ── BATCH SAFE-CAP: 500 images max ──────────────────
+  if (snapCounter >= BATCH_MAX_IMAGES) {
+    showToast(`Batch full (${BATCH_MAX_IMAGES} images). Finish this batch and start a new one.`, 'error', 5000);
+    return;
+  }
+
+  fireFlash();
+
+  // Haptic Feedback
+  if (navigator.vibrate) navigator.vibrate(50);
+
+  const blob = await captureFrame();
+  if (!blob) {
+    showToast('Camera not ready', 'error');
+    return;
+  }
+
+  const receiptId = uid();
+  snapCounter++;
+  pendingCount++;
+  $snapCount.textContent = snapCounter;
+
+  // Warn at 90% capacity
+  if (snapCounter === Math.floor(BATCH_MAX_IMAGES * 0.9)) {
+    showToast(`${BATCH_MAX_IMAGES - snapCounter} snaps remaining in this batch`, 'info', 4000);
+  }
+
+  // Save to IndexedDB immediately
+  const database = await getIDB();
+  await database.put(STORE_NAME, {
+    id: receiptId,
+    batchId: batchId,
+    blob: blob,
+    status: 'pending_upload',
+    createdAt: Date.now()
+  });
+
+  // Add thumbnail to queue (track ObjectURL for cleanup)
+  const thumbUrl = URL.createObjectURL(blob);
+  activeObjectURLs.set(receiptId, thumbUrl);
+  addThumbnailToQueue(receiptId, thumbUrl, 'pending_upload', null);
+  updateFinishButton();
+
+  // Trigger upload
+  uploadPending();
+});
+
+// ────────────────────────────────────────────────────────
+// 8. Reactive Queue UI
+// ────────────────────────────────────────────────────────
+function addThumbnailToQueue(id, thumbUrl, status, firestoreData) {
+  // Remove empty-state message if present
+  const empty = $queueList.querySelector('.queue-empty');
+  if (empty) empty.remove();
+
+  // Prevent duplicates
+  if (document.getElementById(`q-${id}`)) {
+    updateThumbnailStatus(id, status, firestoreData);
+    return;
+  }
+
+  const div = document.createElement('div');
+  div.className = `q-card ${status}`;
+  div.id = `q-${id}`;
+  div.onclick = () => openPreview(id, thumbUrl, firestoreData);
+
+  // Thumbnail
+  const img = document.createElement('img');
+  img.src = thumbUrl;
+  div.appendChild(img);
+
+  // Progress Bar
+  const prog = document.createElement('div');
+  prog.className = 'progress-overlay';
+  div.appendChild(prog);
+
+  // Status Icons
+  const iconCheck = document.createElement('span');
+  iconCheck.className = 'status-icon material-symbols-rounded icon-check';
+  iconCheck.textContent = 'check_circle';
+  div.appendChild(iconCheck);
+
+  const iconSparkle = document.createElement('span');
+  iconSparkle.className = 'status-icon material-symbols-rounded icon-sparkle';
+  iconSparkle.textContent = 'auto_awesome';
+  function updateThumbnailStatus(id, status, firestoreData) {
+    const card = document.getElementById(`q-${id}`);
+    if (!card) return;
+    applyCardState(card, status);
+    if (firestoreData) card._firestoreData = firestoreData;
+  }
+
+  function applyCardState(card, status) {
+    card.classList.remove('uploading', 'synced', 'extracted');
+    switch (status) {
+      case 'pending_upload':
+        // Blue border (default CSS)
+        break;
+      case 'uploading':
+        card.classList.add('uploading');
+        break;
+      case 'synced':
+        card.classList.add('synced');
+        break;
+      case 'extracted':
+        card.classList.add('extracted');
+        break;
+    }
+  }
+
+  function updateFinishButton() {
+    // Uses in-memory pendingCount (reliable even after Delete-on-Success clears IDB)
+    $btnFinish.disabled = pendingCount > 0;
+  }
+
+  // ────────────────────────────────────────────────────────
+  // 9. Upload Engine — Background Sync
+  // ────────────────────────────────────────────────────────
+  async function uploadPending() {
+    if (isUploading) return;
+    isUploading = true;
+    $syncInd.classList.add('uploading');
+
+    const database = await getIDB();
+    let pending = await database.getAllFromIndex(STORE_NAME, 'status', 'pending_upload');
+    // Filter to current batch
+    pending = pending.filter(r => r.batchId === batchId);
+
+    // If nothing to upload, schedule next check and exit
+    if (pending.length === 0) {
+      isUploading = false;
+      $syncInd.classList.remove('uploading');
+      scheduleUpload(15000); // idle check
+      return;
+    }
+
+    for (const receipt of pending) {
+      try {
+        // Mark uploading
+        receipt.status = 'uploading';
+        await database.put(STORE_NAME, receipt);
+        updateThumbnailStatus(receipt.id, 'uploading');
+
+        // Upload WebP blob to Firebase Storage with Progress
+        const storagePath = `receipts/${batchId}/${receipt.id}.webp`;
+        const ref = storage.ref(storagePath);
+        const task = ref.put(receipt.blob, { contentType: 'image/webp' });
+
+        // Promisify the upload task
+        await new Promise((resolve, reject) => {
+          task.on('state_changed',
+            (snapshot) => {
+              const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+              updateThumbnailStatus(receipt.id, 'uploading', null, progress);
+            },
+            (error) => reject(error),
+            () => resolve()
+          );
+        });
+
+        const downloadUrl = await task.snapshot.ref.getDownloadURL();
+
+        // Write metadata to Firestore
+        await db.collection('batches').doc(batchId)
+          .collection('receipts').doc(receipt.id).set({
+            storageUrl: downloadUrl,
+            storagePath: storagePath,
+            status: 'synced',
+            extracted: false,
+            uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
+          });
+
+        // ── DELETE-ON-SUCCESS ──────────────────────────────
+        // Blob confirmed in Firebase Storage → purge from IDB to free memory.
+        await database.delete(STORE_NAME, receipt.id);
+
+        // Revoke the local ObjectURL to release the blob from browser memory
+        const oldUrl = activeObjectURLs.get(receipt.id);
+        if (oldUrl) {
+          URL.revokeObjectURL(oldUrl);
+          activeObjectURLs.delete(receipt.id);
+        }
+
+        // Update the card's image and status
+        const card = document.getElementById(`q-${receipt.id}`);
+        if (card) {
+          const img = card.querySelector('img');
+          if (img) img.src = downloadUrl;
+          card._firestoreData = { storageUrl: downloadUrl };
+        }
+
+        pendingCount = Math.max(0, pendingCount - 1);
+        updateThumbnailStatus(receipt.id, 'synced');
+
+        // Success? Reset backoff
+        uploadRetryDelay = 15000;
+
+      } catch (err) {
+        console.error(`Upload failed for ${receipt.id}:`, err);
+        receipt.status = 'pending_upload';
+        await database.put(STORE_NAME, receipt);
+        updateThumbnailStatus(receipt.id, 'pending_upload');
+
+        // Exponential Backoff
+        uploadRetryDelay = Math.min(uploadRetryDelay * 1.5, 300000); // cap at 5 mins
+        console.log(`Backing off upload for ${uploadRetryDelay}ms`);
+        break; // stop queue
+      }
+    }
+
+    isUploading = false;
+    $syncInd.classList.remove('uploading');
+    updateFinishButton();
+
+    // Schedule next run
+    scheduleUpload(pending.length > 0 ? 1000 : uploadRetryDelay);
+  }
+
+  function scheduleUpload(delay) {
+    if (uploadTimer) clearTimeout(uploadTimer);
+    uploadTimer = setTimeout(uploadPending, delay);
+  }
+
+  // Retry every 15 seconds
+  setInterval(() => {
+    if (!batchId) return;
+    uploadPending();
+  }, 15000);
+
+  // ────────────────────────────────────────────────────────
+  // 10. Firestore Listener — AI Extraction Updates
+  // ────────────────────────────────────────────────────────
+  function startExtractionListener() {
+    if (!batchId) return;
+    db.collection('batches').doc(batchId)
+      .collection('receipts')
+      .where('extracted', '==', true)
+      .onSnapshot(snapshot => {
+        snapshot.docChanges().forEach(change => {
+          if (change.type === 'added' || change.type === 'modified') {
+            const data = change.doc.data();
+            updateThumbnailStatus(change.doc.id, 'extracted', data);
+            // IDB record already deleted by Delete-on-Success — no update needed.
+          }
+        });
+      }, err => console.warn('Snapshot listener error:', err));
+  }
+
+  // ────────────────────────────────────────────────────────
+  // 11. Preview Modal
+  // ────────────────────────────────────────────────────────
+  async function openPreview(id, thumbUrl, firestoreData) {
+    $modal.style.display = 'flex';
+
+    // Revoke previous modal ObjectURL to prevent leak
+    if ($modalImg._objectUrl) {
+      URL.revokeObjectURL($modalImg._objectUrl);
+      $modalImg._objectUrl = null;
+    }
+
+    // Try IDB first (for un-uploaded images), fall back to remote URL
+    const database = await getIDB();
+    const rec = await database.get(STORE_NAME, id);
+    if (rec && rec.blob) {
+      const objUrl = URL.createObjectURL(rec.blob);
+      $modalImg._objectUrl = objUrl; // track for cleanup
+      $modalImg.src = objUrl;
+    } else if (firestoreData && firestoreData.storageUrl) {
+      $modalImg.src = firestoreData.storageUrl;
+    } else if (thumbUrl) {
+      $modalImg.src = thumbUrl;
+    }
+
+    // Fetch latest data from Firestore
+    let data = firestoreData;
+    try {
+      const docSnap = await db.collection('batches').doc(batchId)
+        .collection('receipts').doc(id).get();
+      if (docSnap.exists) data = docSnap.data();
+    } catch (e) { /* offline, use cached */ }
+
+    // XSS-SAFE: Build modal content with DOM APIs, never innerHTML with user/AI data
+    $modalData.textContent = ''; // Clear previous content safely
+
+    if (data && data.extracted) {
+      const ext = data.extractedData || {};
+      const conf = ext.confidence_score ?? 0;
+      const confColor = conf >= 80 ? 'var(--success)' : 'var(--danger)';
+
+      const table = document.createElement('table');
+
+      // Helper: create a safe table row
+      function addRow(label, value) {
+        const tr = document.createElement('tr');
+        const tdLabel = document.createElement('td');
+        tdLabel.textContent = label;   // textContent is XSS-safe
+        const tdValue = document.createElement('td');
+        tdValue.textContent = value;   // textContent is XSS-safe
+        tr.appendChild(tdLabel);
+        tr.appendChild(tdValue);
+        table.appendChild(tr);
+        return tdValue; // in case caller needs to style it
+      }
+
+      addRow('Date', ext.date || '—');
+      addRow('Vendor', ext.vendor || '—');
+      addRow('Total', ext.total || '—');
+      addRow('Tax', ext.tax || '—');
+      addRow('Category', ext.category || '—');
+      addRow('Invoice #', ext.invoice_number || '—');
+
+      const dupCell = addRow('Duplicate', ext.flag_duplicate ? '⚠ YES' : 'No');
+      if (ext.flag_duplicate) dupCell.classList.add('flag-duplicate');
+
+      // Confidence row with progress bar
+      const confTr = document.createElement('tr');
+      const confLabel = document.createElement('td');
+      confLabel.textContent = 'Confidence';
+      const confValue = document.createElement('td');
+      confValue.textContent = `${conf}%`;
+
+      const barWrap = document.createElement('div');
+      barWrap.className = 'confidence-bar';
+      const barFill = document.createElement('div');
+      barFill.className = 'confidence-fill';
+      barFill.style.width = `${Math.min(Math.max(conf, 0), 100)}%`;
+      barFill.style.background = confColor;
+      barWrap.appendChild(barFill);
+      confValue.appendChild(barWrap);
+
+      confTr.appendChild(confLabel);
+      confTr.appendChild(confValue);
+      table.appendChild(confTr);
+
+      $modalData.appendChild(table);
+    } else {
+      const p = document.createElement('p');
+      p.className = 'modal-placeholder';
+      p.textContent = 'AI extraction pending…';
+      $modalData.appendChild(p);
+    }
+  }
+
+  $modalClose.addEventListener('click', () => {
+    $modal.style.display = 'none';
+    // Cleanup: revoke ObjectURL used by modal preview image
+    if ($modalImg._objectUrl) {
+      URL.revokeObjectURL($modalImg._objectUrl);
+      $modalImg._objectUrl = null;
+    }
+  });
+  $modal.addEventListener('click', (e) => {
+    if (e.target === $modal) {
+      $modal.style.display = 'none';
+      if ($modalImg._objectUrl) {
+        URL.revokeObjectURL($modalImg._objectUrl);
+        $modalImg._objectUrl = null;
+      }
+    }
+  });
+
+  // ────────────────────────────────────────────────────────
+  // 12. Finish Batch
+  // ────────────────────────────────────────────────────────
+  $btnFinish.addEventListener('click', async () => {
+    const confirmFinish = confirm(
+      `Finish batch for "${clientName}"?\n\nAll ${snapCounter} receipt(s) have been synced. The batch will be marked as complete.`
+    );
+    if (!confirmFinish) return;
+
+    try {
+      await db.collection('batches').doc(batchId).update({
+        status: 'completed',
+        completedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        totalReceipts: snapCounter
+      });
+      showToast('Batch completed ✓', 'success');
+      $btnFinish.style.display = 'none';
+      $btnExport.style.display = 'flex';
+    } catch (err) {
+      showToast('Failed to finalize batch', 'error');
+      console.error(err);
+    }
+  });
+
+  // ────────────────────────────────────────────────────────
+  // 13. Export Excel
+  // ────────────────────────────────────────────────────────
+  $btnExport.addEventListener('click', async () => {
+    showToast('Generating Excel report…', 'info', 5000);
+    try {
+      // Get the current user's ID token for authenticated request
+      const idToken = await currentUser.getIdToken(true);
+
+      // Call the Cloud Function export endpoint with auth
+      const resp = await fetch(
+        `https://us-central1-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/export_batch`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`
+          },
+          body: JSON.stringify({ batch_id: batchId })
+        }
+      );
+      const result = await resp.json();
+      if (result.download_url) {
+        window.open(result.download_url, '_blank');
+        showToast('Excel report ready!', 'success');
+      } else {
+        throw new Error(result.error || 'Unknown error');
+      }
+    } catch (err) {
+      showToast('Export failed: ' + err.message, 'error');
+      console.error(err);
+    }
+  });
+
+  // ────────────────────────────────────────────────────────
+  // 14. Back / End Session
+  // ────────────────────────────────────────────────────────
+  $btnBack.addEventListener('click', () => {
+    const sure = confirm('Leave this session? Your local data is safe and will restore automatically.');
+    if (!sure) return;
+    stopCamera();
+    // Don't clear session — "lunch break" will restore it
+    showScreen($setup);
+  });
+
+  // ────────────────────────────────────────────────────────
+  // 15. Anonymous Authentication
+  // ────────────────────────────────────────────────────────
+  async function ensureAuth() {
+    return new Promise((resolve, reject) => {
+      // Listen for auth state changes
+      auth.onAuthStateChanged(async (user) => {
+        if (user) {
+          currentUser = user;
+          console.log('[Auth] Signed in:', user.uid);
+          resolve(user);
+        } else {
+          // No user — sign in anonymously
+          try {
+            const cred = await auth.signInAnonymously();
+            currentUser = cred.user;
+            console.log('[Auth] Anonymous sign-in:', cred.user.uid);
+            resolve(cred.user);
+          } catch (err) {
+            console.error('[Auth] Anonymous sign-in failed:', err);
+            showToast('Authentication failed', 'error');
+            reject(err);
+          }
+        }
+      });
+    });
+  }
+
+  // ────────────────────────────────────────────────────────
+  // 16. Init
+  // ────────────────────────────────────────────────────────
+  (async function init() {
+    // Show empty queue message
+    const emptyMsg = document.createElement('span');
+    emptyMsg.className = 'queue-empty';
+    emptyMsg.textContent = 'Snap a receipt to begin';
+    $queueList.appendChild(emptyMsg);
+
+    // SECURITY: Authenticate before any Firestore/Storage access
+    try {
+      await ensureAuth();
+    } catch (e) {
+      // Auth failed — stay on setup screen, user will see error toast
+      showScreen($setup);
+      return;
+    }
+
+    const restored = await tryRestoreSession();
+    if (restored) {
+      startExtractionListener();
+    } else {
+      showScreen($setup);
+    }
+  })();
+
+  // Start listener once we enter camera screen from setup
+  const cameraObserver = new MutationObserver(() => {
+    if ($camera.classList.contains('active')) {
+      startExtractionListener();
+    }
+  });
+  cameraObserver.observe($camera, { attributes: true, attributeFilter: ['class'] });

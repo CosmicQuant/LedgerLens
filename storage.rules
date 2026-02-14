@@ -1,0 +1,40 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ════════════════════════════════════════════════════
+    // Receipt Images: /receipts/{batchId}/{receiptId}.jpg
+    // ════════════════════════════════════════════════════
+    match /receipts/{batchId}/{fileName} {
+
+      // READ: Authenticated users only
+      allow read: if request.auth != null;
+
+      // WRITE (upload): Authenticated + validation
+      allow write: if request.auth != null
+                   // Max 5 MB per image
+                   && request.resource.size < 5 * 1024 * 1024
+                   // Only image MIME types
+                   && request.resource.contentType.matches('image/(jpeg|png|webp)')
+                   // Must have a file extension
+                   && fileName.matches('.*\\.(jpg|jpeg|png|webp)');
+    }
+
+    // ════════════════════════════════════════════════════
+    // Exports: /exports/{batchId}/{fileName}
+    // Written by Cloud Functions (Admin SDK bypasses rules)
+    // Clients can read with auth
+    // ════════════════════════════════════════════════════
+    match /exports/{batchId}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if false; // Only Admin SDK (Cloud Functions) can write
+    }
+
+    // ════════════════════════════════════════════════════
+    // Default: Deny everything else
+    // ════════════════════════════════════════════════════
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

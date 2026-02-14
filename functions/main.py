@@ -1,0 +1,232 @@
+"""
+LedgerLens — Cloud Function: Receipt AI Extraction
+Trigger: storage_fn.on_object_finalized
+Runtime: Python 3.11
+
+Extracts structured data from receipt images using Google Gemini 1.5 Flash
+via Vertex AI. Stores results in Firestore with duplicate detection.
+"""
+
+import hashlib
+import json
+import os
+import re
+
+import google.generativeai as genai
+from firebase_admin import credentials, firestore, initialize_app, storage
+from firebase_functions import options, storage_fn
+
+# ────────────────────────────────────────────────────────
+# Firebase Admin Init
+# ────────────────────────────────────────────────────────
+initialize_app()
+
+# db = firestore.client()  <-- MOVED INSIDE FUNCTIONS
+
+# Import export function so Firebase discovers it at deploy time
+from export import export_batch  # noqa: F401, E402
+
+# ────────────────────────────────────────────────────────
+# Gemini Configuration
+# ────────────────────────────────────────────────────────
+# The API key is stored in Firebase Secrets Manager and exposed
+# as an environment variable via firebase functions:secrets:set
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+GEMINI_MODEL = "gemini-1.5-flash"
+
+EXTRACTION_PROMPT = """You are a professional receipt/invoice data extraction AI.
+Analyze the receipt image provided and extract the following fields.
+Return ONLY a valid JSON object with these exact keys:
+
+{
+  "date": "YYYY-MM-DD or original format if ambiguous",
+  "vendor": "Business/store name",
+  "total": "Total amount as a number (no currency symbol)",
+  "tax": "Tax amount as a number (0 if not found)",
+  "category": "One of: Food & Beverage, Office Supplies, Travel, Fuel, Utilities, Medical, Equipment, Services, Miscellaneous",
+  "invoice_number": "Invoice or receipt number (empty string if not found)",
+  "confidence_score": 0-100 integer indicating extraction confidence
+}
+
+Rules:
+- Return raw numeric values for total and tax (e.g. 42.50 not "$42.50").
+- If a field is unreadable, use an empty string "" for text or 0 for numbers.
+- confidence_score: 90-100 if all fields clearly readable, 60-89 if some fields
+  are guessed, below 60 if image is blurry or data is mostly unreadable.
+- Return ONLY the JSON object, no markdown fences or extra text.
+"""
+
+
+# ────────────────────────────────────────────────────────
+# Duplicate Detection Hash
+# ────────────────────────────────────────────────────────
+def compute_receipt_hash(data: dict) -> str:
+    """Generate a deterministic hash from key receipt fields for deduplication."""
+    raw = f"{data.get('vendor', '')}" \
+          f"|{data.get('date', '')}" \
+          f"|{data.get('total', '')}" \
+          f"|{data.get('invoice_number', '')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+async def check_duplicate(batch_id: str, receipt_hash: str, current_receipt_id: str) -> bool:
+    """Check if another receipt in this batch already has the same hash."""
+    db = firestore.client()
+    batch_ref = db.collection("batches").document(batch_id).collection("receipts")
+    query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
+    for doc in query:
+        if doc.id != current_receipt_id:
+            return True
+    return False
+
+
+# ────────────────────────────────────────────────────────
+# Gemini Extraction
+# ────────────────────────────────────────────────────────
+def extract_receipt_data(image_bytes: bytes) -> dict:
+    """Send receipt image to Gemini 1.5 Flash and parse structured response."""
+    model = genai.GenerativeModel(GEMINI_MODEL)
+
+    # Build the image part for Gemini
+    image_part = {
+        "mime_type": "image/jpeg",
+        "data": image_bytes,
+    }
+
+    try:
+        response = model.generate_content(
+            [EXTRACTION_PROMPT, image_part],
+            generation_config=genai.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=1024,
+            ),
+        )
+
+        raw_text = response.text.strip()
+
+        # Clean potential markdown fences
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+
+        data = json.loads(raw_text)
+
+        # Validate / enforce schema
+        return {
+            "date":             str(data.get("date", "")),
+            "vendor":           str(data.get("vendor", "")),
+            "total":            _to_float(data.get("total", 0)),
+            "tax":              _to_float(data.get("tax", 0)),
+            "category":         str(data.get("category", "Miscellaneous")),
+            "invoice_number":   str(data.get("invoice_number", "")),
+            "confidence_score": int(data.get("confidence_score", 0)),
+        }
+
+    except json.JSONDecodeError as e:
+        print(f"[Gemini] JSON parse error: {e} — raw: {raw_text[:500]}")
+        return _fallback_data(10)
+    except Exception as e:
+        print(f"[Gemini] Extraction error: {e}")
+        return _fallback_data(0)
+
+
+def _to_float(val) -> float:
+    """Safely parse a numeric value."""
+    try:
+        cleaned = re.sub(r"[^\d.\-]", "", str(val))
+        return round(float(cleaned), 2) if cleaned else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _fallback_data(confidence: int) -> dict:
+    return {
+        "date": "",
+        "vendor": "",
+        "total": 0.0,
+        "tax": 0.0,
+        "category": "Miscellaneous",
+        "invoice_number": "",
+        "confidence_score": confidence,
+    }
+
+
+# ────────────────────────────────────────────────────────
+# Cloud Function — Storage Trigger
+# ────────────────────────────────────────────────────────
+@storage_fn.on_object_finalized(
+    region="us-central1",
+    memory=options.MemoryOption.GB_1,
+    timeout_sec=300,
+    max_instances=20,
+    secrets=["GEMINI_API_KEY"],
+)
+def process_receipt(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]):
+    """
+    Triggered when a receipt image is uploaded to Firebase Storage.
+    Expected path: receipts/{batch_id}/{receipt_id}.jpg
+    """
+    db = firestore.client()
+    storage_client = storage.bucket(event.data.bucket)
+
+    file_path = event.data.name
+    bucket_name = event.data.bucket # This variable is now redundant as storage_client is used directly
+
+    # Guard: only process receipt images
+    if not file_path or not file_path.startswith("receipts/"):
+        print(f"[Skip] Not a receipt path: {file_path}")
+        return
+    if not file_path.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        print(f"[Skip] Not an image: {file_path}")
+        return
+
+    # Parse batch_id and receipt_id from path
+    parts = file_path.split("/")
+    if len(parts) < 3:
+        print(f"[Skip] Unexpected path structure: {file_path}")
+        return
+
+    batch_id = parts[1]
+    receipt_id = parts[2].rsplit(".", 1)[0]  # Remove extension
+
+    print(f"[Process] batch={batch_id} receipt={receipt_id}")
+
+    # Download the image
+    bucket = storage.bucket(bucket_name)
+    blob = bucket.blob(file_path)
+    image_bytes = blob.download_as_bytes()
+
+    # Extract data via Gemini
+    extracted = extract_receipt_data(image_bytes)
+
+    # Compute duplicate hash
+    receipt_hash = compute_receipt_hash(extracted)
+
+    # Check for duplicates within this batch
+    batch_ref = db.collection("batches").document(batch_id).collection("receipts")
+    existing_query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
+    is_duplicate = False
+    for doc in existing_query:
+        if doc.id != receipt_id:
+            is_duplicate = True
+            break
+
+    extracted["flag_duplicate"] = is_duplicate
+
+    # Update Firestore document
+    receipt_ref = batch_ref.document(receipt_id)
+    receipt_ref.update({
+        "extracted": True,
+        "extractedData": extracted,
+        "receipt_hash": receipt_hash,
+        "processedAt": firestore.SERVER_TIMESTAMP,
+    })
+
+    print(
+        f"[Done] receipt={receipt_id} vendor={extracted['vendor']} "
+        f"total={extracted['total']} confidence={extracted['confidence_score']} "
+        f"duplicate={is_duplicate}"
+    )

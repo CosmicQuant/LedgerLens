@@ -1,0 +1,72 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ════════════════════════════════════════════════════
+    // Helper Functions
+    // ════════════════════════════════════════════════════
+
+    // Caller must be authenticated
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    // Caller owns this batch (ownerId matches their UID)
+    function isOwner() {
+      return isAuth() && resource.data.ownerId == request.auth.uid;
+    }
+
+    // For new documents — verify ownerId is set to the caller's UID
+    function ownerIsCallerOnCreate() {
+      return isAuth() && request.resource.data.ownerId == request.auth.uid;
+    }
+
+    // Prevent overwriting immutable fields on update
+    function immutableFields() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['ownerId', 'createdAt']);
+    }
+
+    // ════════════════════════════════════════════════════
+    // Batch Documents: /batches/{batchId}
+    // ════════════════════════════════════════════════════
+    match /batches/{batchId} {
+
+      // CREATE: Must be auth'd, must set ownerId to own UID
+      allow create: if ownerIsCallerOnCreate();
+
+      // READ: Only the owner
+      allow read: if isOwner();
+
+      // UPDATE: Only the owner, cannot change ownerId/createdAt
+      allow update: if isOwner() && immutableFields();
+
+      // DELETE: Denied from client
+      allow delete: if false;
+
+      // ════════════════════════════════════════════════════
+      // Receipt Sub-collection: /batches/{batchId}/receipts/{receiptId}
+      // ════════════════════════════════════════════════════
+      match /receipts/{receiptId} {
+
+        // Must check parent batch ownership
+        function parentIsOwner() {
+          return isAuth() &&
+                 get(/databases/$(database)/documents/batches/$(batchId)).data.ownerId == request.auth.uid;
+        }
+
+        allow create: if parentIsOwner();
+        allow read:   if parentIsOwner();
+        allow update: if parentIsOwner();
+        allow delete: if false;
+      }
+    }
+
+    // ════════════════════════════════════════════════════
+    // Default: Deny everything else
+    // ════════════════════════════════════════════════════
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

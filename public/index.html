@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="description"
+        content="LedgerLens — High-performance offline-first receipt processing PWA for company audit cycles." />
+    <meta name="theme-color" content="#0d0f1a" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#0d0f1a">
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/2921/2921222.png">
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js')
+                    .then(reg => console.log('SW registered:', reg.scope))
+                    .catch(err => console.log('SW failed:', err));
+            });
+        }
+    </script>
+    <title>LedgerLens — Receipt Scanner</title>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+        rel="stylesheet" />
+    <!-- Material Symbols -->
+    <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,1,0" />
+
+    <link rel="stylesheet" href="styles.css" />
+
+    <!-- Firebase SDKs (Compat for simplicity in vanilla JS) -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+    <!-- IDB (IndexedDB wrapper) -->
+    <script src="https://cdn.jsdelivr.net/npm/idb@8/build/umd.js"></script>
+</head>
+
+<body>
+
+    <!-- ═══════════════════════════════════════════════════════
+       SCREEN 1: SETUP
+  ═══════════════════════════════════════════════════════ -->
+    <section id="screen-setup" class="screen active">
+        <div class="setup-container">
+            <button id="btn-theme-toggle" class="btn-icon" aria-label="Toggle Theme">
+                <span class="material-symbols-rounded">dark_mode</span>
+            </button>
+            <div class="logo-area">
+                <span class="material-symbols-rounded logo-icon">receipt_long</span>
+                <h1>LedgerLens</h1>
+                <p class="tagline">Snap &middot; Sync &middot; Audit</p>
+            </div>
+            <form id="form-setup" autocomplete="off">
+                <div class="input-group">
+                    <label for="input-client">Client / Company Name</label>
+                    <input type="text" id="input-client" placeholder="e.g. Acme Corp" required />
+                </div>
+                <div class="input-group">
+                    <label for="input-cycle">Audit Cycle</label>
+                    <input type="text" id="input-cycle" placeholder="e.g. Q4-2025 Annual" required />
+                </div>
+                <button type="submit" id="btn-start" class="btn-primary">
+                    <span class="material-symbols-rounded">play_arrow</span>
+                    Start Batch
+                </button>
+            </form>
+            <button id="btn-history" class="btn-secondary">
+                <span class="material-symbols-rounded">history</span> Past Batches
+            </button>
+            <div class="version-tag">Version 1.1 • Offline-Ready</div>
+        </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════
+       SCREEN 2: CAMERA + QUEUE
+  ═══════════════════════════════════════════════════════ -->
+    <section id="screen-camera" class="screen">
+        <!-- Top Bar -->
+        <header id="top-bar">
+            <div class="bar-left">
+                <span class="material-symbols-rounded" id="btn-back">arrow_back</span>
+                <div class="session-info">
+                    <span id="lbl-client" class="bar-client">—</span>
+                    <span id="lbl-batch" class="bar-batch">Batch —</span>
+                </div>
+            </div>
+            <div class="bar-right">
+                <div class="counter-pill" id="counter-pill">
+                    <span class="material-symbols-rounded">photo_camera</span>
+                    <span id="snap-count">0</span>
+                </div>
+                <button id="btn-torch" class="btn-icon hidden" aria-label="Toggle Flashlight">
+                    <span class="material-symbols-rounded">flash_on</span>
+                </button>
+                <div class="sync-indicator" id="sync-indicator" title="Sync status">
+                    <span class="material-symbols-rounded">cloud_done</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Camera Viewfinder -->
+        <div id="viewfinder-wrap">
+            <video id="camera-feed" autoplay playsinline muted></video>
+            <div class="scan-overlay">
+                <div class="corner tl"></div>
+                <div class="corner tr"></div>
+                <div class="corner bl"></div>
+                <div class="corner br"></div>
+            </div>
+            <div id="flash-fx" class="flash-fx"></div>
+        </div>
+
+        <!-- Shutter Button -->
+        <div id="shutter-area">
+            <button id="btn-snap" class="btn-shutter" aria-label="Capture receipt">
+                <span class="shutter-ring"></span>
+            </button>
+        </div>
+
+        <!-- Thumbnail Queue -->
+        <div id="queue-strip">
+            <div id="queue-list" class="queue-list">
+                <!-- Thumbnails injected here -->
+            </div>
+        </div>
+
+        <!-- Bottom Actions -->
+        <div id="bottom-actions">
+            <button id="btn-finish" class="btn-finish" disabled>
+                <span class="material-symbols-rounded">check_circle</span>
+                Finish Batch
+            </button>
+            <button id="btn-export" class="btn-export" style="display:none;">
+                <span class="material-symbols-rounded">download</span>
+                Export Excel
+            </button>
+        </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════
+       TOAST NOTIFICATIONS
+  ═══════════════════════════════════════════════════════ -->
+    <div id="toast-container"></div>
+
+    <!-- ═══════════════════════════════════════════════════════
+       MODAL: Receipt Detail Preview
+  ═══════════════════════════════════════════════════════ -->
+    <div id="modal-preview" class="modal-overlay" style="display:none;">
+        <div class="modal-card">
+            <button id="modal-close" class="modal-close-btn">
+                <span class="material-symbols-rounded">close</span>
+            </button>
+            <img id="modal-img" src="" alt="Receipt preview" />
+            <div id="modal-data" class="modal-data">
+                <p class="modal-placeholder">AI extraction pending…</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
