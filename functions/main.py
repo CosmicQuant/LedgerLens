@@ -16,6 +16,9 @@ import firebase_admin
 from firebase_admin import credentials, firestore, initialize_app, storage
 from firebase_functions import options, storage_fn
 
+# Type hints for Firebase sentinel values
+from typing import Optional, Dict, Any
+
 
 
 # Import export function so Firebase discovers it at deploy time
@@ -130,8 +133,9 @@ def extract_receipt_data(image_bytes: bytes) -> dict:
             # Try next model (quota, server error, etc)
             continue
 
-    print("[Gemini] All models failed. Returning fallback data.")
-    return _fallback_data(0)
+    print("[Gemini] All models failed.")
+    # Raise error to be caught by caller instead of returning fallback
+    raise RuntimeError("All Gemini models failed to extract data.")
 
 
 def _to_float(val) -> float:
@@ -203,43 +207,97 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
         blob = bucket.blob(file_path)
         image_bytes = blob.download_as_bytes()
 
-        # Extract data via Gemini
-        extracted = extract_receipt_data(image_bytes)
+        # ── IDEMPOTENCY CHECK (Cost Optimization) ────────────────
+        # Calculate SHA256 of raw image bytes to detect duplicates BEFORE calling AI
+        image_hash_sha256 = hashlib.sha256(image_bytes).hexdigest()
+        
+        # Check global receipts for this image hash
+        # Note: Requires a single-field index on 'image_hash_sha256' if the collection grows large,
+        # but works automatically for basic equality queries in Firestore.
+        existing_docs = db.collection_group("receipts")\
+                          .where("image_hash_sha256", "==", image_hash_sha256)\
+                          .limit(1).get()
 
-        # Compute duplicate hash
-        receipt_hash = compute_receipt_hash(extracted)
-
-        # Check for duplicates within this batch - Wrap in TRY to prevent 403/Index crashes
-        is_duplicate = False
-        try:
-            batch_ref = db.collection("batches").document(batch_id).collection("receipts")
-            existing_query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
-            for doc in existing_query:
-                if doc.id != receipt_id:
-                    is_duplicate = True
-                    break
-        except Exception as q_err:
-            print(f"[Warning] Duplicate check failed: {q_err}")
+        if existing_docs:
+            print(f"[Idempotency] Found existing match for hash {image_hash_sha256[:8]}...")
+            existing_data: Optional[Dict[str, Any]] = existing_docs[0].to_dict()
             
-        extracted["flag_duplicate"] = is_duplicate
+            # Reuse the extraction data if available
+            if existing_data and existing_data.get("extracted") and existing_data.get("extractedData"):
+                print("[Idempotency] Skipping Gemini call. Copying data.")
+                reused_data = existing_data["extractedData"]
+                reused_data["source"] = "cache_hit" # Mark as reused
+                
+                # Write result immediately
+                batch_ref = db.collection("batches").document(batch_id).collection("receipts")
+                batch_ref.document(receipt_id).set({
+                    "extracted": True,
+                    "extractedData": reused_data,
+                    "receipt_hash": reused_data.get("receipt_hash", ""), # Keep legacy hash
+                    "image_hash_sha256": image_hash_sha256,
+                    "processedAt": firestore.SERVER_TIMESTAMP,  # type: ignore
+                    "status": "extracted"
+                }, merge=True)
+                
+                # Increment count
+                db.collection("batches").document(batch_id).set({
+                    "receiptCount": firestore.Increment(1)  # type: ignore
+                }, merge=True)
+                
+                return # EXIT FUNCTION
+        
+        # ─────────────────────────────────────────────────────────
 
-        # Update Firestore document
-        print(f"[Firestore] Updating receipt {receipt_id} in {batch_id}")
-        receipt_ref = batch_ref.document(receipt_id)
-        receipt_ref.set({
-            "extracted": True,
-            "extractedData": extracted,
-            "receipt_hash": receipt_hash,
-            "processedAt": firestore.SERVER_TIMESTAMP,
-        }, merge=True)
+        # Extract data via Gemini
+        try:
+            extracted = extract_receipt_data(image_bytes)
+            
+            # Compute duplicate hash (Legacy logic based on content)
+            receipt_hash = compute_receipt_hash(extracted)
+            
+            # Check for duplicates within this batch - Wrap in TRY to prevent 403/Index crashes
+            is_duplicate = False
+            try:
+                batch_ref = db.collection("batches").document(batch_id).collection("receipts")
+                existing_query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
+                for doc in existing_query:
+                    if doc.id != receipt_id:
+                        is_duplicate = True
+                        break
+            except Exception as q_err:
+                print(f"[Warning] Duplicate check failed: {q_err}")
+            
+            extracted["flag_duplicate"] = is_duplicate
 
-        # Increment receiptCount in the parent batch document
-        print(f"[Firestore] Incrementing count for batch {batch_id}")
-        db.collection("batches").document(batch_id).set({
-            "receiptCount": firestore.Increment(1)
-        }, merge=True)
+            # Update Firestore document
+            print(f"[Firestore] Updating receipt {receipt_id} in {batch_id}")
+            receipt_ref = batch_ref.document(receipt_id)
+            receipt_ref.set({
+                "extracted": True,
+                "extractedData": extracted,
+                "receipt_hash": receipt_hash,
+                "image_hash_sha256": image_hash_sha256, # Store for future idempotency
+                "processedAt": firestore.SERVER_TIMESTAMP,  # type: ignore
+                "status": "extracted" 
+            }, merge=True)
 
-        print(f"[Done] receipt={receipt_id} vendor={extracted.get('vendor')}")
+            # Increment receiptCount in the parent batch document
+            print(f"[Firestore] Incrementing count for batch {batch_id}")
+            db.collection("batches").document(batch_id).set({
+                "receiptCount": firestore.Increment(1)  # type: ignore
+            }, merge=True)
+
+            print(f"[Done] receipt={receipt_id} vendor={extracted.get('vendor')}")
+
+        except Exception as e:
+            print(f"[ERROR] Extraction failed for {receipt_id}: {e}")
+            # Update Firestore with error status so client knows
+            batch_ref.document(receipt_id).set({
+                "status": "error",
+                "error_message": str(e),
+                "processedAt": firestore.SERVER_TIMESTAMP  # type: ignore
+            }, merge=True)
+            return
 
     except Exception as e:
         print(f"[ERROR] on_receipt_upload failed for {event.data.name}: {str(e)}")

@@ -63,6 +63,8 @@ def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
 
     # ── 1. Fetch batch metadata ──────────────────────────
     import pandas as pd
+    import xlsxwriter
+
     batch_ref = db.collection("batches").document(batch_id)
     batch_doc = batch_ref.get()
     if not batch_doc.exists:

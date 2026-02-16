@@ -72,6 +72,14 @@ body {
   color: var(--text-primary);
   -webkit-tap-highlight-color: transparent;
   -webkit-font-smoothing: antialiased;
+
+  /* Initial load state: hidden */
+  opacity: 0;
+  transition: opacity 0.25s ease-in;
+}
+
+body.loaded {
+  opacity: 1;
 }
 
 button {
@@ -88,13 +96,30 @@ input {
 .screen {
   position: fixed;
   inset: 0;
-  display: none;
+  display: none !important;
+  /* Force hide inactive screens */
   flex-direction: column;
   overflow-y: auto;
+  z-index: 10;
+  background-color: var(--bg-primary);
+  /* Ensure solid background so layers don't bleed through */
 }
 
 .screen.active {
-  display: flex;
+  display: flex !important;
+  /* Force show active screen */
+}
+
+/* Auth specific - ensure it covers everything */
+#screen-auth {
+  justify-content: center;
+  align-items: center;
+  background:
+    radial-gradient(circle at top right, var(--accent-glow), transparent),
+    radial-gradient(circle at bottom left, var(--ai-glow), transparent),
+    var(--bg-primary);
+  /* Add solid base color */
+  z-index: 100;
 }
 
 #screen-auth {
@@ -102,6 +127,8 @@ input {
   align-items: center;
   background: radial-gradient(circle at top right, var(--accent-glow), transparent),
     radial-gradient(circle at bottom left, var(--ai-glow), transparent);
+  z-index: 100;
+  /* Ensure auth screen is always on top */
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -114,6 +141,7 @@ input {
     radial-gradient(ellipse at 30% 20%, rgba(99, 130, 255, .12) 0%, transparent 60%),
     radial-gradient(ellipse at 70% 80%, rgba(192, 132, 252, .08) 0%, transparent 60%),
     var(--bg-primary);
+  z-index: 90;
 }
 
 .setup-container {
@@ -133,6 +161,25 @@ input {
   filter: drop-shadow(0 0 24px var(--accent-glow));
   display: block;
   margin: 0 auto 12px;
+  position: relative;
+  overflow: hidden;
+  /* Contains the beam */
+  animation: scan-pulse 3s ease-in-out infinite;
+}
+
+.logo-icon::after {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: 0;
+  width: 100%;
+  height: 40%;
+  /* Green Scanner Beam Gradient */
+  background: linear-gradient(to bottom, transparent, var(--success), transparent);
+  opacity: 0.6;
+  animation: scan-beam 3s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  mix-blend-mode: screen;
+  pointer-events: none;
 }
 
 .logo-area h1 {
@@ -187,18 +234,32 @@ input {
 }
 
 .btn-logout {
-  background: transparent;
-  border: none;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
   color: var(--danger);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   cursor: pointer;
-  padding: 4px 8px;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  transition: all 0.2s;
 }
 
-.input-group {
-  margin-bottom: 20px;
-  text-align: left;
+.btn-logout:hover {
+  background: rgba(255, 94, 122, 0.1);
+}
+
+.user-profile {
+  margin-top: 10px;
+  padding: 12px;
+  background: var(--bg-card);
+  /* Ensure solid background */
+  border-radius: var(--radius-sm);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
 }
 
 .input-group label {
@@ -317,18 +378,23 @@ input {
    CAMERA SCREEN
    ═══════════════════════════════════════════════════════ */
 
-/* ── Top Bar ─────────────────────────────────────── */
+/* ── Top Bar Overlay ────────────────────────────── */
 #top-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
-  padding-top: max(12px, env(safe-area-inset-top));
-  background: var(--bg-glass);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border-bottom: 1px solid var(--border);
-  z-index: 10;
+  padding: 16px;
+  padding-top: max(16px, env(safe-area-inset-top));
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.8) 0%, transparent 100%);
+  border-bottom: none;
+  backdrop-filter: none;
+  color: #fff;
+  /* Force white text */
 }
 
 .bar-left {
@@ -339,13 +405,17 @@ input {
 
 #btn-back {
   font-size: 24px;
-  color: var(--text-secondary);
+  color: #fff;
+  background: rgba(255, 255, 255, 0.15);
+  padding: 8px;
+  border-radius: 50%;
+  backdrop-filter: blur(4px);
   cursor: pointer;
-  transition: color .15s;
+  transition: background .15s;
 }
 
 #btn-back:hover {
-  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.3);
 }
 
 .session-info {
@@ -356,11 +426,13 @@ input {
 .bar-client {
   font-size: 14px;
   font-weight: 700;
+  color: #fff;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
 }
 
 .bar-batch {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: rgba(255, 255, 255, 0.8);
 }
 
 .bar-right {
@@ -422,11 +494,23 @@ input {
   display: none;
 }
 
-/* ── Viewfinder ──────────────────────────────────── */
-#viewfinder-wrap {
-  flex: 1;
+/* ── Viewfinder (Full Screen) ────────────────────── */
+#screen-camera {
+  display: block;
+  /* Remove flex column to allow overlays */
   position: relative;
+  height: 100vh;
   overflow: hidden;
+  background: #000;
+}
+
+#viewfinder-wrap {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  /* Base layer */
   background: #000;
 }
 
@@ -434,88 +518,23 @@ input {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  transform: scaleX(1);
+  /* Ensure no mirroring unless desired */
 }
 
-/* Scan Overlay Corners */
-/* Status Icons */
-.status-icon {
-  position: absolute;
-  bottom: 6px;
-  right: 6px;
-  font-size: 18px;
-  display: none;
-  /* Hidden by default */
-  pointer-events: none;
-  border-radius: 50%;
-  background: var(--bg-primary);
-  line-height: 1;
-  padding: 1px;
-  z-index: 3;
+.bar-batch {
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 
-.q-card.synced .icon-check {
-  display: block;
-  color: var(--success);
-}
-
-.q-card.extracted .icon-sparkle {
-  display: block;
-  color: var(--ai-sparkle);
-}
-
-/* Delete Button on Card */
-.btn-card-del {
-  position: absolute;
-  top: -10px;
-  right: -10px;
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  background: #ff4d4d;
-  color: #fff;
-  border: 2px solid #fff;
-  /* High contrast border */
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  z-index: 10;
-  transition: transform 0.2s, background 0.2s;
-  padding: 0;
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
-  /* More professional shadow */
-}
-
-/* Ensure icons don't block clicks */
-.btn-card-del span {
-  pointer-events: none;
-}
-
-.btn-card-del:hover {
-  transform: scale(1.15);
-  background: #ff0000;
-}
-
-/* Touch devices: always show delete button */
-@media (hover: none) {
-  .btn-card-del {
-    opacity: 1;
-  }
-}
-
-.q-card:hover .btn-card-del {
-  opacity: 1;
-}
-
-.btn-card-del .material-symbols-rounded {
-  font-size: 18px;
-}
-
-/* Scan Overlay Corners */
+/* Scan Overlay Corners - Ensure visibility */
 .scan-overlay {
   position: absolute;
   inset: 10%;
   pointer-events: none;
+  z-index: 10;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
 }
 
 .corner {
@@ -650,24 +669,29 @@ input {
   display: none !important;
 }
 
-/* ── Shutter ─────────────────────────────────────── */
+/* ── Shutter Overlay ────────────────────────────── */
 #shutter-area {
+  position: absolute;
+  bottom: 80px;
+  /* Above bottom actions */
+  left: 0;
+  right: 0;
+  z-index: 20;
   display: flex;
   justify-content: center;
   align-items: center;
   gap: 24px;
-  padding: 18px 0;
-  background: var(--bg-glass);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border-top: 1px solid var(--border);
-  z-index: 10;
+  padding: 20px;
+  background: transparent;
+  border: none;
+  backdrop-filter: none;
 }
 
 .btn-icon-pill {
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid var(--border);
-  color: var(--text);
+  background: rgba(0, 0, 0, 0.4);
+  /* Darker for overlay */
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #fff;
   width: 48px;
   height: 48px;
   border-radius: 50%;
@@ -676,50 +700,25 @@ input {
   justify-content: center;
   cursor: pointer;
   transition: all 0.2s;
+  backdrop-filter: blur(4px);
 }
 
 .btn-icon-pill:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.6);
   transform: scale(1.05);
 }
 
-.btn-icon-pill:active {
-  transform: scale(0.95);
-}
-
-.btn-shutter {
-  width: 72px;
-  height: 72px;
-  border-radius: 50%;
-  background: transparent;
-  position: relative;
-  transition: transform .12s;
-}
-
-.btn-shutter:active {
-  transform: scale(0.9);
-}
-
-.shutter-ring {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border-radius: 50%;
-  border: 4px solid var(--accent);
-  background: radial-gradient(circle, var(--accent-glow) 40%, transparent 70%);
-  transition: background .15s, transform .1s;
-}
-
-.btn-shutter:active .shutter-ring {
-  background: radial-gradient(circle, var(--accent) 30%, transparent 70%);
-  transform: scale(0.95);
-}
-
-/* ── Queue Strip ─────────────────────────────────── */
+/* ── Queue Strip Overlay ────────────────────────── */
 #queue-strip {
-  background: var(--bg-secondary);
-  border-top: 1px solid var(--border);
-  padding: 10px 12px;
+  position: absolute;
+  bottom: 180px;
+  /* Above shutter */
+  left: 0;
+  right: 0;
+  z-index: 15;
+  background: transparent;
+  border: none;
+  padding: 0 16px;
   overflow-x: auto;
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
@@ -730,6 +729,8 @@ input {
   gap: 10px;
   min-height: 72px;
   align-items: center;
+  justify-content: center;
+  /* Center thumbnails */
 }
 
 /* Thumbnail Card */
@@ -739,7 +740,8 @@ input {
   height: 64px;
   position: relative;
   cursor: pointer;
-  /* overflow: visible to allow the delete button to float */
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  /* Better visibility on video */
 }
 
 .q-card-inner {
@@ -835,14 +837,19 @@ input {
   letter-spacing: 0.5px;
 }
 
-/* ── Bottom Actions ──────────────────────────────── */
+/* ── Bottom Actions Overlay ──────────────────────── */
 #bottom-actions {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
   display: flex;
   gap: 10px;
-  padding: 10px 16px;
-  padding-bottom: max(10px, var(--safe-bottom));
-  background: var(--bg-secondary);
-  border-top: 1px solid var(--border);
+  padding: 16px;
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.9) 0%, transparent 100%);
+  border-top: none;
 }
 
 .btn-finish,
@@ -1235,4 +1242,207 @@ input {
   color: var(--accent);
   font-weight: 600;
   cursor: pointer;
+}
+
+/* Logo Animation */
+@keyframes float {
+  0% {
+    transform: translateY(0px) rotate(0deg);
+  }
+
+  50% {
+    transform: translateY(-10px) rotate(2deg);
+  }
+
+  100% {
+    transform: translateY(0px) rotate(0deg);
+  }
+}
+
+/* Scanner Animation */
+@keyframes scan-beam {
+  0% {
+    top: -50%;
+    opacity: 0;
+  }
+
+  15% {
+    opacity: 1;
+  }
+
+  85% {
+    opacity: 1;
+  }
+
+  100% {
+    top: 150%;
+    opacity: 0;
+  }
+}
+
+@keyframes scan-pulse {
+  0% {
+    filter: drop-shadow(0 0 16px var(--accent-glow));
+    color: var(--accent);
+  }
+
+  50% {
+    filter: drop-shadow(0 0 24px var(--success-glow));
+    color: var(--success);
+    /* Flash Green */
+  }
+
+  100% {
+    filter: drop-shadow(0 0 16px var(--accent-glow));
+    color: var(--accent);
+  }
+}
+
+.logo-icon {
+  font-size: 56px;
+  color: var(--accent);
+  filter: drop-shadow(0 0 24px var(--accent-glow));
+  display: block;
+  width: max-content;
+  /* Constrain width to icon size */
+  margin: 0 auto 12px;
+  position: relative;
+  overflow: hidden;
+  /* Contains the beam */
+  animation: scan-pulse 3s ease-in-out infinite;
+}
+
+.logo-icon::after {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: 0;
+  width: 100%;
+  height: 40%;
+  /* Green Scanner Beam Gradient */
+  background: linear-gradient(to bottom, transparent, var(--success), transparent);
+  opacity: 0.6;
+  animation: scan-beam 3s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+
+/* ── Notification Models (Professional) ────────── */
+.notification-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s, visibility 0.2s;
+}
+
+.notification-modal-overlay.active {
+  opacity: 1;
+  visibility: visible;
+}
+
+.notification-card {
+  background: var(--bg-card);
+  width: 90%;
+  max-width: 360px;
+  border-radius: var(--radius-lg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+  padding: 24px;
+  transform: scale(0.95);
+  transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  text-align: center;
+  border: 1px solid var(--border);
+}
+
+.notification-modal-overlay.active .notification-card {
+  transform: scale(1);
+}
+
+.notification-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  margin: 0 auto 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+}
+
+.notification-icon.info {
+  background: var(--surface);
+  color: var(--accent);
+}
+
+.notification-icon.success {
+  background: var(--success-glow);
+  color: var(--success);
+}
+
+.notification-icon.error {
+  background: rgba(255, 94, 122, 0.15);
+  color: var(--danger);
+}
+
+.notification-icon.warning {
+  background: rgba(255, 200, 92, 0.15);
+  color: var(--warning);
+}
+
+.notification-title {
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  color: var(--text-primary);
+}
+
+.notification-message {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 24px;
+  line-height: 1.5;
+}
+
+.notification-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.notification-btn {
+  flex: 1;
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  transition: filter 0.2s;
+}
+
+.notification-btn.primary {
+  background: var(--accent);
+  color: white;
+}
+
+.notification-btn.secondary {
+  background: var(--surface);
+  color: var(--text-primary);
+}
+
+.notification-btn.danger {
+  background: var(--danger);
+  color: white;
+}
+
+.notification-btn:active {
+  filter: brightness(0.9);
+  transform: scale(0.98);
 }
