@@ -49,6 +49,8 @@ export async function uploadPending() {
                 .collection('receipts').doc(receipt.id).set({
                     storageUrl: downloadUrl,
                     storagePath: storagePath,
+                    file_path: storagePath, // For compatibility
+                    file_extension: 'webp',
                     status: 'synced',
                     extracted: false,
                     uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -58,25 +60,16 @@ export async function uploadPending() {
             // Blob confirmed in Firebase Storage → purge from IDB to free memory.
             await deleteReceiptFromIDB(receipt.id);
 
-            // Also remove thumbnail if we were storing it separately in IDB, though currently 
-            // we might only be storing one object. If we move to separate thumbnail storage, handle it here.
-
-            // Revoke the local ObjectURL to release the blob from browser memory
-            const oldUrl = state.activeObjectURLs.get(receipt.id);
-            if (oldUrl) {
-                URL.revokeObjectURL(oldUrl);
-                state.activeObjectURLs.delete(receipt.id);
-            }
-
-            // Update the card's image and status
+            // Update the card's firestore data
             const card = document.getElementById(`q-${receipt.id}`);
             if (card) {
-                const img = card.querySelector('img');
-                // If we had a high-res local blob, switch to the remote URL to free memory?
-                // Actually, wait for the remote URL to load might be jarring.
-                // But since we deleted the local blob, we MUST switch to remote URL or keep the thumbnail.
-                if (img) img.src = downloadUrl;
-                card._firestoreData = { storageUrl: downloadUrl };
+                card._firestoreData = {
+                    storageUrl: downloadUrl,
+                    storagePath: storagePath,
+                    status: 'synced'
+                };
+                // NOTE: We keep showing the local ObjectURL (thumbnail) to avoid flicker.
+                // The remote storageUrl is now stored in _firestoreData for previews.
             }
 
             state.pendingCount = Math.max(0, state.pendingCount - 1);

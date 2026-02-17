@@ -13,6 +13,7 @@
     <link rel="manifest" href="manifest.json">
     <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/2921/2921222.png">
     <script>
+        // Register Service Worker from index_main.html
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
                 navigator.serviceWorker.register('/sw.js')
@@ -43,7 +44,15 @@
     <!-- IDB (IndexedDB wrapper) -->
     <script src="https://cdn.jsdelivr.net/npm/idb@8/build/umd.js"></script>
     <!-- Main App (Module) -->
-    <script type="module" src="app.js"></script>
+    <script type="module" src="main.js"></script>
+    <style>
+        /* Failsafe: Ensure content is visible if JS crashes */
+        body {
+            opacity: 1 !important;
+            visibility: visible !important;
+            transition: none !important;
+        }
+    </style>
 </head>
 
 <body>
@@ -125,35 +134,38 @@
             <div id="flash-fx" class="flash-fx"></div>
         </div>
 
-        <!-- Shutter Button Area -->
-        <div id="shutter-area">
-            <button id="btn-gallery" class="btn-icon-pill" aria-label="Bulk Upload">
-                <span class="material-symbols-rounded">photo_library</span>
-            </button>
-            <button id="btn-snap" class="btn-shutter" aria-label="Capture receipt">
-                <span class="shutter-ring"></span>
-            </button>
-            <input type="file" id="input-bulk" multiple accept="image/*" style="display: none;" />
-        </div>
+        <!-- NEW: Control Deck Wrapper -->
+        <div class="control-deck">
+            <!-- Thumbnail Queue -->
+            <div id="queue-strip">
+                <div id="queue-list" class="queue-list"></div>
+            </div>
 
-        <!-- Thumbnail Queue -->
-        <div id="queue-strip">
-            <div id="queue-list" class="queue-list">
-                <!-- Thumbnails injected here -->
+            <!-- Main Actions Row -->
+            <div id="shutter-area">
+                <button id="btn-gallery" class="btn-icon-pill" aria-label="Bulk Upload">
+                    <span class="material-symbols-rounded">photo_library</span>
+                </button>
+
+                <button id="btn-snap" class="btn-shutter" aria-label="Capture receipt">
+                    <span class="shutter-ring"></span>
+                </button>
+
+                <!-- Moved Finish Button here for the 3-column layout -->
+                <div id="bottom-actions">
+                    <button id="btn-finish" class="btn-finish" disabled aria-label="Finish Batch">
+                        <span class="material-symbols-rounded">check</span>
+                    </button>
+                    <button id="btn-export" class="btn-export" style="display:none;" aria-label="Export Excel">
+                        <span class="material-symbols-rounded">ios_share</span>
+                    </button>
+                </div>
             </div>
         </div>
 
-        <!-- Bottom Actions -->
-        <div id="bottom-actions">
-            <button id="btn-finish" class="btn-finish" disabled>
-                <span class="material-symbols-rounded">check_circle</span>
-                Finish Batch
-            </button>
-            <button id="btn-export" class="btn-export" style="display:none;">
-                <span class="material-symbols-rounded">download</span>
-                Export Excel
-            </button>
-        </div>
+        <input type="file" id="input-bulk" multiple accept="image/*" style="display: none;" />
+
+        <!-- Bottom Actions (Legacy removed) -->
     </section>
 
     <!-- ═══════════════════════════════════════════════════════

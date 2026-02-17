@@ -36,6 +36,25 @@ export const DOM = {
     // ... add others as needed
 };
 
+// Wire up global modal close (Safety for user report: modal not closing)
+if (DOM.modalClose) {
+    DOM.modalClose.onclick = () => {
+        DOM.modal.style.display = 'none';
+        if (DOM.modalImg._objectUrl) {
+            URL.revokeObjectURL(DOM.modalImg._objectUrl);
+            DOM.modalImg._objectUrl = null;
+        }
+    };
+}
+
+if (DOM.modal) {
+    DOM.modal.onclick = (e) => {
+        if (e.target === DOM.modal) {
+            DOM.modal.style.display = 'none';
+        }
+    };
+}
+
 export function showScreen(screenEl) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     screenEl.classList.add('active');
@@ -122,7 +141,20 @@ export function showToast(msg, type = 'info', duration = 3000) {
 
 export function updateFinishButton() {
     // Only enable if there's at least one receipt and no active uploads
-    DOM.btnFinish.disabled = (state.snapCounter === 0 || state.pendingCount > 0);
+    if (DOM.btnFinish) {
+        DOM.btnFinish.disabled = (state.snapCounter === 0 || state.pendingCount > 0);
+    }
+}
+
+export function setBatchCompleted(isCompleted) {
+    if (isCompleted) {
+        if (DOM.btnFinish) DOM.btnFinish.style.display = 'none';
+        if (DOM.btnExport) DOM.btnExport.style.display = 'flex';
+    } else {
+        if (DOM.btnFinish) DOM.btnFinish.style.display = 'flex';
+        if (DOM.btnExport) DOM.btnExport.style.display = 'none';
+        updateFinishButton();
+    }
 }
 
 export function addThumbnailToQueue(id, thumbUrl, status, firestoreData, onDelete) {
@@ -178,15 +210,8 @@ export function addThumbnailToQueue(id, thumbUrl, status, firestoreData, onDelet
     badgeProc.textContent = 'AI Processing...';
     inner.appendChild(badgeProc);
 
-    // Initial Visibility
-    if (status === 'synced' || status === 'uploaded') {
-        div.classList.add('is-processing');
-    }
-
-    // Check for Invalid state
-    if (firestoreData && firestoreData.extractedData && firestoreData.extractedData.category === 'Invalid') {
-        div.classList.add('is-invalid');
-    }
+    // Force remove processing if extracted/invalid/error
+    updateThumbnailStatus(id, status, firestoreData);
 
     // Check for Error state (New feature from review)
     if (firestoreData && firestoreData.status === 'error') {
@@ -213,28 +238,41 @@ export function updateThumbnailStatus(id, status, firestoreData, uploadProgress)
     const card = document.getElementById(`q-${id}`);
     if (!card) return;
 
-    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload');
+    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload', 'is-processing', 'is-invalid', 'pending_retry');
     card.classList.add(status);
 
     if (firestoreData) card._firestoreData = firestoreData;
 
-    // Toggle processing badge
-    if (status === 'synced' || status === 'uploaded' || status === 'uploading') {
+    // Logic: Is it currently processing?
+    // Processing if: status is synced/uploaded AND extracted is NOT true
+    const isActuallyExtracted = status === 'extracted' || (firestoreData && firestoreData.extracted);
+    const hasError = status === 'error' || (firestoreData && firestoreData.status === 'error');
+    const isInvalid = firestoreData && firestoreData.extractedData && firestoreData.extractedData.category === 'Invalid';
+
+    if (!isActuallyExtracted && !hasError && !isInvalid && (status === 'synced' || status === 'uploaded' || status === 'uploading' || status === 'pending_retry' || status === 'processing')) {
         card.classList.add('is-processing');
-    } else {
-        card.classList.remove('is-processing');
+
+        // Granular Labels (New Feature)
+        const badgeProc = card.querySelector('.badge-proc');
+        if (badgeProc) {
+            if (status === 'uploading') badgeProc.textContent = 'Uploading...';
+            else if (status === 'synced' || status === 'uploaded') badgeProc.textContent = 'Uploaded';
+            else if (status === 'processing') badgeProc.textContent = 'Extracting...';
+            else if (status === 'pending_retry') badgeProc.textContent = 'Retrying...';
+            else badgeProc.textContent = 'AI Processing...';
+        }
     }
 
-    // Handle Invalid/Error state override
-    if (firestoreData && firestoreData.extractedData && firestoreData.extractedData.category === 'Invalid') {
+    if (isInvalid || hasError) {
         card.classList.add('is-invalid');
-        card.classList.remove('is-processing');
+        if (hasError) {
+            const badge = card.querySelector('.badge-invalid');
+            if (badge) badge.textContent = 'Error';
+        }
     }
-    if (firestoreData && firestoreData.status === 'error') {
-        card.classList.add('is-invalid');
-        card.classList.remove('is-processing');
-        const badge = card.querySelector('.badge-invalid');
-        if (badge) badge.textContent = 'Error';
+
+    if (isActuallyExtracted) {
+        card.classList.add('extracted');
     }
 
     // Progress bar
@@ -288,17 +326,44 @@ export async function openPreview(id, thumbUrl, firestoreData) {
 
     if (data && data.extracted) {
         renderEditForm(data.extractedData, id);
-    } else if (data && data.status === 'error') {
-        const p = document.createElement('p');
-        p.className = 'modal-placeholder error';
-        p.textContent = `Processing Error: ${data.error_message || 'Unknown error'}`;
-        p.style.color = 'var(--error)';
-        DOM.modalData.appendChild(p);
     } else {
         const p = document.createElement('p');
         p.className = 'modal-placeholder';
-        p.textContent = 'AI extraction pending…';
+
+        if (data && data.status === 'error') {
+            p.classList.add('error');
+            p.textContent = `AI Error: ${data.error_message || 'Unknown error'}`;
+            p.style.color = 'var(--error)';
+        } else if (data && data.status === 'processing') {
+            p.innerHTML = '<span class="material-symbols-rounded spin">sync</span> AI is working...';
+        } else {
+            p.textContent = 'AI extraction pending…';
+        }
         DOM.modalData.appendChild(p);
+
+        // Add Retry Button if not extracted
+        const btnRetry = document.createElement('button');
+        btnRetry.className = 'btn-primary btn-retry-ai';
+        btnRetry.style.marginTop = '15px';
+        btnRetry.innerHTML = '<span class="material-symbols-rounded">refresh</span> Retry AI Extraction';
+        btnRetry.onclick = async () => {
+            btnRetry.disabled = true;
+            btnRetry.innerHTML = '<span class="material-symbols-rounded spin">sync</span> Triggering...';
+            try {
+                await firestore.collection('batches').doc(state.batchId)
+                    .collection('receipts').doc(id).update({
+                        status: 'pending_retry',
+                        updatedAt: new Date()
+                    });
+                showToast('Retry triggered. Please wait...');
+                DOM.modal.style.display = 'none'; // Close modal to let user see queue
+            } catch (err) {
+                showToast('Failed to trigger retry: ' + err.message);
+                btnRetry.disabled = false;
+                btnRetry.innerHTML = 'Retry AI Extraction';
+            }
+        };
+        DOM.modalData.appendChild(btnRetry);
     }
 }
 
@@ -377,4 +442,9 @@ async function saveReceiptData(id) {
     } catch (err) {
         showToast('Update failed: ' + err.message, 'error');
     }
+}
+
+// Force reload modules if they are stuck
+if (!window.location.hash.includes('reloaded')) {
+    // Optional: could force reload here, but let's rely on the file rename first.
 }

@@ -12,6 +12,7 @@ from datetime import datetime
 
 import firebase_admin
 from firebase_admin import auth, firestore, storage, initialize_app
+from google.cloud.firestore_v1.base_query import FieldFilter
 from firebase_functions import https_fn, options
 
 

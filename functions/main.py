@@ -14,6 +14,7 @@ import re
 
 import firebase_admin
 from firebase_admin import credentials, firestore, initialize_app, storage
+from google.cloud.firestore_v1.base_query import FieldFilter
 from firebase_functions import options, storage_fn
 
 # Type hints for Firebase sentinel values
@@ -33,27 +34,25 @@ from export import export_batch  # noqa: F401, E402
 
 
 
-EXTRACTION_PROMPT = """You are a professional receipt/invoice data extraction AI.
-Analyze the receipt image provided and extract the following fields.
-Return ONLY a valid JSON object with these exact keys:
+EXTRACTION_PROMPT = """You are a professional auditor and receipt data extraction expert.
+Analyze the provided receipt/invoice image and extract the following structured fields.
 
+Return ONLY a valid JSON object with these exact keys:
 {
-  "date": "YYYY-MM-DD or original format if ambiguous",
-  "vendor": "Business/store name",
-  "total": "Total amount as a number (no currency symbol)",
-  "tax": "Tax amount as a number (0 if not found)",
+  "date": "YYYY-MM-DD (format as ISO 8601 if possible)",
+  "vendor": "Official business name",
+  "total": "Numeric total amount including tax",
+  "tax": "Numeric tax amount (0.0 if not found)",
   "category": "One of: Food & Beverage, Office Supplies, Travel, Fuel, Utilities, Medical, Equipment, Services, Miscellaneous",
-  "invoice_number": "Invoice or receipt number (empty string if not found)",
-  "confidence_score": 0-100 integer indicating extraction confidence
+  "invoice_number": "Invoice/Receipt reference number",
+  "confidence_score": 0-100 (integer)
 }
 
 Rules:
-- If the image is NOT a receipt or invoice, return a JSON with all fields empty strings/0 and set category to "Invalid".
-- Return raw numeric values for total and tax (e.g. 42.50 not "$42.50").
-- If a field is unreadable, use an empty string "" for text or 0 for numbers.
-- confidence_score: 90-100 if all fields clearly readable, 60-89 if some fields
-  are guessed, below 60 if image is blurry or data is mostly unreadable.
-- Return ONLY the JSON object, no markdown fences or extra text.
+1. If the image is not a receipt or invoice, return category "Invalid" and empty strings/0.
+2. Ensure 'total' and 'tax' are pure numbers (e.g. 1250.00, not "1,250.00").
+3. Use your best judgment for 'category' based on the vendor and items.
+4. Output ONLY the raw JSON string. No preamble, no markdown formatting.
 """
 
 
@@ -65,11 +64,14 @@ Rules:
 # ────────────────────────────────────────────────────────
 def extract_receipt_data(image_bytes: bytes) -> dict:
     """Send receipt image to Gemini with fallback to smaller model if needed."""
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     
     api_key = os.environ.get("GEMINI_API_KEY")
-    if api_key:
-        genai.configure(api_key=api_key)
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable not set.")
+        
+    client = genai.Client(api_key=api_key)
 
     # Models to try in order of preference
     models_to_try = [
@@ -77,22 +79,20 @@ def extract_receipt_data(image_bytes: bytes) -> dict:
         "gemini-flash-lite-latest"
     ]
 
-    # Build the image part for Gemini
-    image_part = {
-        "mime_type": "image/jpeg",
-        "data": image_bytes,
-    }
-
-    for model_name in models_to_try:
+    for model_id in models_to_try:
         try:
-            print(f"[Gemini] Attempting extraction with {model_name}...")
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(
-                [EXTRACTION_PROMPT, image_part],
-                generation_config=genai.GenerationConfig(
+            print(f"[Gemini] Attempting extraction with {model_id}...")
+            
+            response = client.models.generate_content(
+                model=model_id,
+                contents=[
+                    EXTRACTION_PROMPT,
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+                ],
+                config=types.GenerateContentConfig(
                     temperature=0.1,
                     max_output_tokens=1024,
-                ),
+                )
             )
 
             raw_text = response.text.strip()
@@ -121,20 +121,16 @@ def extract_receipt_data(image_bytes: bytes) -> dict:
                 "category":         str(data.get("category", "Miscellaneous")),
                 "invoice_number":   str(data.get("invoice_number", "")),
                 "confidence_score": int(data.get("confidence_score", 0)),
-                "model_used":       model_name
+                "model_used":       model_id
             }
 
-        except json.JSONDecodeError as e:
-            print(f"[Gemini] {model_name} parse error: {e}")
-            # Try next model or fallback
-            continue
         except Exception as e:
-            print(f"[Gemini] {model_name} error: {e}")
-            # Try next model (quota, server error, etc)
+            print(f"[Gemini] {model_id} error: {e}")
+            # Try next model (quota, server error, parse error, etc)
             continue
 
     print("[Gemini] All models failed.")
-    # Raise error to be caught by caller instead of returning fallback
+    # Raise error to be caught by caller
     raise RuntimeError("All Gemini models failed to extract data.")
 
 
@@ -168,6 +164,9 @@ def compute_receipt_hash(data: dict) -> str:
 # ────────────────────────────────────────────────────────
 # Cloud Function — Storage Trigger
 # ────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────
+# Cloud Function — Storage Trigger
+# ────────────────────────────────────────────────────────
 @storage_fn.on_object_finalized(
     region="us-central1",
     memory=options.MemoryOption.GB_1,
@@ -182,7 +181,6 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
     try:
         if not firebase_admin._apps:
             initialize_app()
-        db = firestore.client()
         
         file_path = event.data.name
         bucket_name = event.data.bucket
@@ -193,14 +191,28 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
         if not file_path.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
             return
 
-        # Parse batch_id and receipt_id from path
         parts = file_path.split("/")
         if len(parts) < 3: return
+        batch_id, receipt_id = parts[1], parts[2].rsplit(".", 1)[0]
 
-        batch_id = parts[1]
-        receipt_id = parts[2].rsplit(".", 1)[0]
+        process_receipt_extraction(batch_id, receipt_id, bucket_name, file_path)
 
-        print(f"[Process] batch={batch_id} receipt={receipt_id} bucket={bucket_name}")
+    except Exception as e:
+        print(f"[ERROR] on_receipt_upload failed: {str(e)}")
+
+
+# ────────────────────────────────────────────────────────
+# Core Extraction Helper
+# ────────────────────────────────────────────────────────
+def process_receipt_extraction(batch_id: str, receipt_id: str, bucket_name: str, file_path: str):
+    """
+    Downloads image, runs AI extraction, and updates Firestore.
+    Shared by storage trigger and manual retry trigger.
+    """
+    if not firebase_admin._apps: initialize_app()
+    db = firestore.client()
+    try:
+        print(f"[Process] batch={batch_id} receipt={receipt_id} path={file_path}")
 
         # Download the image
         bucket = storage.bucket(bucket_name)
@@ -208,98 +220,111 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
         image_bytes = blob.download_as_bytes()
 
         # ── IDEMPOTENCY CHECK (Cost Optimization) ────────────────
-        # Calculate SHA256 of raw image bytes to detect duplicates BEFORE calling AI
         image_hash_sha256 = hashlib.sha256(image_bytes).hexdigest()
         
         # Check global receipts for this image hash
-        # Note: Requires a single-field index on 'image_hash_sha256' if the collection grows large,
-        # but works automatically for basic equality queries in Firestore.
         existing_docs = db.collection_group("receipts")\
-                          .where("image_hash_sha256", "==", image_hash_sha256)\
+                          .where(filter=FieldFilter("image_hash_sha256", "==", image_hash_sha256))\
                           .limit(1).get()
 
         if existing_docs:
-            print(f"[Idempotency] Found existing match for hash {image_hash_sha256[:8]}...")
+            print(f"[Idempotency] Found match for {image_hash_sha256[:8]}...")
             existing_data: Optional[Dict[str, Any]] = existing_docs[0].to_dict()
             
-            # Reuse the extraction data if available
-            if existing_data and existing_data.get("extracted") and existing_data.get("extractedData"):
+            if existing_data and existing_data.get("status") == "extracted":
                 print("[Idempotency] Skipping Gemini call. Copying data.")
                 reused_data = existing_data["extractedData"]
-                reused_data["source"] = "cache_hit" # Mark as reused
+                reused_data["source"] = "cache_hit"
                 
-                # Write result immediately
-                batch_ref = db.collection("batches").document(batch_id).collection("receipts")
-                batch_ref.document(receipt_id).set({
-                    "extracted": True,
-                    "extractedData": reused_data,
-                    "receipt_hash": reused_data.get("receipt_hash", ""), # Keep legacy hash
-                    "image_hash_sha256": image_hash_sha256,
-                    "processedAt": firestore.SERVER_TIMESTAMP,  # type: ignore
-                    "status": "extracted"
-                }, merge=True)
-                
-                # Increment count
-                db.collection("batches").document(batch_id).set({
-                    "receiptCount": firestore.Increment(1)  # type: ignore
-                }, merge=True)
-                
-                return # EXIT FUNCTION
+                _finalize_extraction(db, batch_id, receipt_id, reused_data, image_hash_sha256)
+                return
+
+        # ── GEMINI EXTRACTION ────────────────────────────────────
+        extracted = extract_receipt_data(image_bytes)
+        receipt_hash = compute_receipt_hash(extracted)
         
-        # ─────────────────────────────────────────────────────────
-
-        # Extract data via Gemini
+        # Duplicate detection within batch
+        is_duplicate = False
         try:
-            extracted = extract_receipt_data(image_bytes)
-            
-            # Compute duplicate hash (Legacy logic based on content)
-            receipt_hash = compute_receipt_hash(extracted)
-            
-            # Check for duplicates within this batch - Wrap in TRY to prevent 403/Index crashes
-            is_duplicate = False
-            try:
-                batch_ref = db.collection("batches").document(batch_id).collection("receipts")
-                existing_query = batch_ref.where("receipt_hash", "==", receipt_hash).limit(2).stream()
-                for doc in existing_query:
-                    if doc.id != receipt_id:
-                        is_duplicate = True
-                        break
-            except Exception as q_err:
-                print(f"[Warning] Duplicate check failed: {q_err}")
-            
-            extracted["flag_duplicate"] = is_duplicate
-
-            # Update Firestore document
-            print(f"[Firestore] Updating receipt {receipt_id} in {batch_id}")
-            receipt_ref = batch_ref.document(receipt_id)
-            receipt_ref.set({
-                "extracted": True,
-                "extractedData": extracted,
-                "receipt_hash": receipt_hash,
-                "image_hash_sha256": image_hash_sha256, # Store for future idempotency
-                "processedAt": firestore.SERVER_TIMESTAMP,  # type: ignore
-                "status": "extracted" 
-            }, merge=True)
-
-            # Increment receiptCount in the parent batch document
-            print(f"[Firestore] Incrementing count for batch {batch_id}")
-            db.collection("batches").document(batch_id).set({
-                "receiptCount": firestore.Increment(1)  # type: ignore
-            }, merge=True)
-
-            print(f"[Done] receipt={receipt_id} vendor={extracted.get('vendor')}")
-
-        except Exception as e:
-            print(f"[ERROR] Extraction failed for {receipt_id}: {e}")
-            # Update Firestore with error status so client knows
-            batch_ref.document(receipt_id).set({
-                "status": "error",
-                "error_message": str(e),
-                "processedAt": firestore.SERVER_TIMESTAMP  # type: ignore
-            }, merge=True)
-            return
+            batch_ref = db.collection("batches").document(batch_id).collection("receipts")
+            existing_query = batch_ref.where(filter=FieldFilter("receipt_hash", "==", receipt_hash)).limit(2).stream()
+            for doc in existing_query:
+                if doc.id != receipt_id:
+                    is_duplicate = True
+                    break
+        except Exception as q_err:
+            print(f"[Warning] Duplicate check failed: {q_err}")
+        
+        extracted["flag_duplicate"] = is_duplicate
+        _finalize_extraction(db, batch_id, receipt_id, extracted, image_hash_sha256, receipt_hash)
 
     except Exception as e:
-        print(f"[ERROR] on_receipt_upload failed for {event.data.name}: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        print(f"[ERROR] Extraction failed for {receipt_id}: {e}")
+        db.collection("batches").document(batch_id).collection("receipts").document(receipt_id).set({
+            "status": "error",
+            "error_message": str(e),
+            "processedAt": firestore.SERVER_TIMESTAMP  # type: ignore
+        }, merge=True)
+
+
+def _finalize_extraction(db, batch_id: str, receipt_id: str, data: dict, img_hash: str, receipt_hash: str = ""):
+    """Updates Firestore and increments batch count if not already done."""
+    receipt_ref = db.collection("batches").document(batch_id).collection("receipts").document(receipt_id)
+    
+    # Check if this receipt was already counted as 'extracted'
+    snap = receipt_ref.get()
+    was_extracted = snap.exists and snap.to_dict().get("extracted") is True
+
+    receipt_ref.set({
+        "extracted": True,
+        "extractedData": data,
+        "receipt_hash": receipt_hash or data.get("receipt_hash", ""),
+        "image_hash_sha256": img_hash,
+        "processedAt": firestore.SERVER_TIMESTAMP,  # type: ignore
+        "status": "extracted"
+    }, merge=True)
+
+    if not was_extracted:
+        print(f"[Firestore] Incrementing count for batch {batch_id}")
+        db.collection("batches").document(batch_id).set({
+            "receiptCount": firestore.Increment(1)  # type: ignore
+        }, merge=True)
+
+
+# ────────────────────────────────────────────────────────
+# Cloud Function — Firestore Trigger (Retry)
+# ────────────────────────────────────────────────────────
+from firebase_functions import firestore_fn
+
+@firestore_fn.on_document_updated(
+    document="batches/{batch_id}/receipts/{receipt_id}",
+    secrets=["GEMINI_API_KEY"]
+)
+def on_receipt_retry(event: firestore_fn.Event[firestore_fn.Change[firestore_fn.DocumentSnapshot]]):
+    """
+    Triggered when a receipt document is updated.
+    Listens for status == 'pending_retry'.
+    """
+    if not event.data: return
+    
+    new_data = event.data.after.to_dict()
+    old_data = event.data.before.to_dict()
+    
+    if not new_data or not old_data: return
+
+    # Trigger only if status CHANGED to 'pending_retry'
+    if new_data.get("status") == "pending_retry" and old_data.get("status") != "pending_retry":
+        print(f"[Retry] Triggered for {event.params['receipt_id']}")
+        
+        batch_id = event.params["batch_id"]
+        receipt_id = event.params["receipt_id"]
+        
+        # We need the storage path
+        file_path = new_data.get("storagePath") or new_data.get("file_path")
+        if not file_path:
+            ext = new_data.get("file_extension", "webp")
+            file_path = f"receipts/{batch_id}/{receipt_id}.{ext}"
+            
+        if not firebase_admin._apps: initialize_app()
+        bucket_name = storage.bucket().name
+        process_receipt_extraction(batch_id, receipt_id, bucket_name, file_path)
