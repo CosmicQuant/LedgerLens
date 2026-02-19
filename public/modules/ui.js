@@ -8,16 +8,18 @@ export const DOM = {
     authScreen: document.getElementById('screen-auth'),
     formSetup: document.getElementById('form-setup'),
     inputClient: document.getElementById('input-client'),
-    inputCycle: document.getElementById('input-cycle'),
+    inputCategories: document.getElementById('input-categories'),
     btnStart: document.getElementById('btn-start'),
     btnHistory: document.getElementById('btn-history'),
     btnBack: document.getElementById('btn-back'),
     lblClient: document.getElementById('lbl-client'),
     lblBatch: document.getElementById('lbl-batch'),
     snapCount: document.getElementById('snap-count'),
+    usageMeter: document.getElementById('usage-meter'),
     syncInd: document.getElementById('sync-indicator'),
     video: document.getElementById('camera-feed'),
     btnSnap: document.querySelector('.btn-shutter'),
+    btnGallery: document.getElementById('btn-gallery'),
     queueList: document.querySelector('.queue-list'),
     btnFinish: document.getElementById('btn-finish'),
     btnExport: document.getElementById('btn-export'),
@@ -29,11 +31,12 @@ export const DOM = {
     btnTorch: document.getElementById('btn-torch'),
     btnTheme: document.getElementById('btn-theme-toggle'),
     btnResetSession: document.getElementById('btn-reset-session'),
+    btnStressTest: document.getElementById('btn-stress-test'),
+    btnStressCleanup: document.getElementById('btn-stress-cleanup'),
     userProfile: document.getElementById('user-profile'),
     userDisplayEmail: document.getElementById('user-display-email'),
     btnLogout: document.getElementById('btn-logout'),
     btnGoogleLogin: document.getElementById('btn-google-login'),
-    // ... add others as needed
 };
 
 // Wire up global modal close (Safety for user report: modal not closing)
@@ -139,10 +142,30 @@ export function showToast(msg, type = 'info', duration = 3000) {
     }, duration);
 }
 
-export function updateFinishButton() {
-    // Only enable if there's at least one receipt and no active uploads
+export function updateFinishButton(totalCount, pendingCount) {
     if (DOM.btnFinish) {
-        DOM.btnFinish.disabled = (state.snapCounter === 0 || state.pendingCount > 0);
+        DOM.btnFinish.disabled = (totalCount === 0 || pendingCount > 0);
+    }
+}
+
+/**
+ * Update the usage meter display and color zone.
+ * Called by BatchStateManager subscriber.
+ */
+export function updateUsageMeter({ totalCount, limit, zone, isAtLimit }) {
+    if (DOM.snapCount) DOM.snapCount.textContent = totalCount;
+
+    if (DOM.usageMeter) {
+        DOM.usageMeter.classList.remove('zone-normal', 'zone-warning', 'zone-limit');
+        DOM.usageMeter.classList.add(`zone-${zone}`);
+    }
+
+    // Disable/enable shutter and gallery buttons
+    if (DOM.btnSnap) {
+        DOM.btnSnap.classList.toggle('at-limit', isAtLimit);
+    }
+    if (DOM.btnGallery) {
+        DOM.btnGallery.classList.toggle('at-limit', isAtLimit);
     }
 }
 
@@ -153,7 +176,6 @@ export function setBatchCompleted(isCompleted) {
     } else {
         if (DOM.btnFinish) DOM.btnFinish.style.display = 'flex';
         if (DOM.btnExport) DOM.btnExport.style.display = 'none';
-        updateFinishButton();
     }
 }
 
@@ -209,6 +231,12 @@ export function addThumbnailToQueue(id, thumbUrl, status, firestoreData, onDelet
     badgeProc.className = 'badge-proc';
     badgeProc.textContent = 'AI Processing...';
     inner.appendChild(badgeProc);
+
+    // Duplicate Badge
+    const badgeDup = document.createElement('div');
+    badgeDup.className = 'badge-duplicate';
+    badgeDup.textContent = 'Duplicate';
+    inner.appendChild(badgeDup);
 
     // Force remove processing if extracted/invalid/error
     updateThumbnailStatus(id, status, firestoreData);
@@ -274,6 +302,11 @@ export function updateThumbnailStatus(id, status, firestoreData, uploadProgress)
     if (isActuallyExtracted) {
         card.classList.add('extracted');
     }
+
+    // Duplicate detection — check top-level flag_duplicate
+    const isDuplicate = firestoreData && (firestoreData.flag_duplicate === true ||
+        (firestoreData.extractedData && firestoreData.extractedData.flag_duplicate === true));
+    card.classList.toggle('is-duplicate', !!isDuplicate);
 
     // Progress bar
     if (uploadProgress !== undefined) {
@@ -418,6 +451,14 @@ function renderEditForm(ext, id) {
     confP.style.color = 'var(--text-secondary)';
     confP.textContent = `AI Confidence: ${conf}%`;
     DOM.modalData.appendChild(confP);
+
+    // Duplicate warning banner
+    if (ext.flag_duplicate) {
+        const dupBanner = document.createElement('div');
+        dupBanner.className = 'duplicate-banner';
+        dupBanner.innerHTML = '<span class="material-symbols-rounded">content_copy</span> This receipt appears to be a <strong>duplicate</strong> of another receipt in this batch.';
+        DOM.modalData.insertBefore(dupBanner, DOM.modalData.firstChild);
+    }
 }
 
 async function saveReceiptData(id) {

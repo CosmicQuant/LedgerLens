@@ -10,7 +10,9 @@ via Vertex AI. Stores results in Firestore with duplicate detection.
 import hashlib
 import json
 import os
+import random
 import re
+import time
 
 import firebase_admin
 from firebase_admin import credentials, firestore, initialize_app, storage
@@ -34,26 +36,38 @@ from export import export_batch  # noqa: F401, E402
 
 
 
-EXTRACTION_PROMPT = """You are a professional auditor and receipt data extraction expert.
+DEFAULT_CATEGORIES = [
+    "Food & Beverage", "Office Supplies", "Travel", "Fuel",
+    "Utilities", "Medical", "Equipment", "Services", "Miscellaneous"
+]
+
+EXTRACTION_PROMPT_TEMPLATE = """You are a professional auditor and receipt data extraction expert.
 Analyze the provided receipt/invoice image and extract the following structured fields.
 
 Return ONLY a valid JSON object with these exact keys:
-{
+{{
   "date": "YYYY-MM-DD (format as ISO 8601 if possible)",
   "vendor": "Official business name",
   "total": "Numeric total amount including tax",
   "tax": "Numeric tax amount (0.0 if not found)",
-  "category": "One of: Food & Beverage, Office Supplies, Travel, Fuel, Utilities, Medical, Equipment, Services, Miscellaneous",
+  "category": "One of: {categories}",
   "invoice_number": "Invoice/Receipt reference number",
   "confidence_score": 0-100 (integer)
-}
+}}
 
 Rules:
 1. If the image is not a receipt or invoice, return category "Invalid" and empty strings/0.
 2. Ensure 'total' and 'tax' are pure numbers (e.g. 1250.00, not "1,250.00").
 3. Use your best judgment for 'category' based on the vendor and items.
-4. Output ONLY the raw JSON string. No preamble, no markdown formatting.
+4. You MUST categorize into one of the categories listed above. Pick the closest match.
+5. Output ONLY the raw JSON string. No preamble, no markdown formatting.
 """
+
+
+def build_extraction_prompt(categories: list = None) -> str:
+    """Build the Gemini prompt with custom or default categories."""
+    cats = categories if categories else DEFAULT_CATEGORIES
+    return EXTRACTION_PROMPT_TEMPLATE.format(categories=", ".join(cats))
 
 
 
@@ -62,8 +76,8 @@ Rules:
 # ────────────────────────────────────────────────────────
 # Gemini Extraction
 # ────────────────────────────────────────────────────────
-def extract_receipt_data(image_bytes: bytes) -> dict:
-    """Send receipt image to Gemini with fallback to smaller model if needed."""
+def extract_receipt_data(image_bytes: bytes, categories: list = None) -> dict:
+    """Send receipt image to Gemini with retry + exponential backoff."""
     from google import genai
     from google.genai import types
     
@@ -73,65 +87,84 @@ def extract_receipt_data(image_bytes: bytes) -> dict:
         
     client = genai.Client(api_key=api_key)
 
+    # Build prompt with custom or default categories
+    prompt = build_extraction_prompt(categories)
+
     # Models to try in order of preference
     models_to_try = [
         "gemini-flash-latest",
         "gemini-flash-lite-latest"
     ]
 
+    last_error = None
+
     for model_id in models_to_try:
-        try:
-            print(f"[Gemini] Attempting extraction with {model_id}...")
-            
-            response = client.models.generate_content(
-                model=model_id,
-                contents=[
-                    EXTRACTION_PROMPT,
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=1024,
+        # Retry each model up to 3 times with exponential backoff
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"[Gemini] Retry {attempt} for {model_id} after {delay:.1f}s")
+                    time.sleep(delay)
+
+                print(f"[Gemini] Attempting extraction with {model_id} (attempt {attempt + 1}/3)")
+                
+                response = client.models.generate_content(
+                    model=model_id,
+                    contents=[
+                        prompt,
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=1024,
+                    )
                 )
-            )
 
-            raw_text = response.text.strip()
+                raw_text = response.text.strip()
 
-            # Clean potential markdown fences
-            if raw_text.startswith("```"):
-                raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-                raw_text = re.sub(r"\s*```$", "", raw_text)
+                # Clean potential markdown fences
+                if raw_text.startswith("```"):
+                    raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+                    raw_text = re.sub(r"\s*```$", "", raw_text)
 
-            # Robust JSON extraction
-            json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-            if json_match:
-                raw_text = json_match.group(0)
-            
-            # Final attempt to clean trailing commas or weirdness
-            raw_text = re.sub(r",\s*\}", "}", raw_text)
+                # Robust JSON extraction
+                json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                if json_match:
+                    raw_text = json_match.group(0)
+                
+                # Final attempt to clean trailing commas or weirdness
+                raw_text = re.sub(r",\s*\}", "}", raw_text)
 
-            data = json.loads(raw_text)
+                data = json.loads(raw_text)
 
-            # Validate / enforce schema
-            return {
-                "date":             str(data.get("date", "")),
-                "vendor":           str(data.get("vendor", "")),
-                "total":            _to_float(data.get("total", 0)),
-                "tax":              _to_float(data.get("tax", 0)),
-                "category":         str(data.get("category", "Miscellaneous")),
-                "invoice_number":   str(data.get("invoice_number", "")),
-                "confidence_score": int(data.get("confidence_score", 0)),
-                "model_used":       model_id
-            }
+                # Validate / enforce schema
+                return {
+                    "date":             str(data.get("date", "")),
+                    "vendor":           str(data.get("vendor", "")),
+                    "total":            _to_float(data.get("total", 0)),
+                    "tax":              _to_float(data.get("tax", 0)),
+                    "category":         str(data.get("category", "Miscellaneous")),
+                    "invoice_number":   str(data.get("invoice_number", "")),
+                    "confidence_score": int(data.get("confidence_score", 0)),
+                    "model_used":       model_id
+                }
 
-        except Exception as e:
-            print(f"[Gemini] {model_id} error: {e}")
-            # Try next model (quota, server error, parse error, etc)
-            continue
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                # Only retry on rate-limit or transient errors
+                is_retryable = any(kw in error_str for kw in ['429', 'resource_exhausted', 'rate', 'quota', 'overloaded', 'unavailable', '503', '500'])
+                
+                if is_retryable and attempt < 2:
+                    print(f"[Gemini] {model_id} retryable error (attempt {attempt + 1}): {e}")
+                    continue  # retry same model
+                else:
+                    print(f"[Gemini] {model_id} error (attempt {attempt + 1}): {e}")
+                    break  # move to next model
 
-    print("[Gemini] All models failed.")
-    # Raise error to be caught by caller
-    raise RuntimeError("All Gemini models failed to extract data.")
+    print(f"[Gemini] All models failed after retries. Last error: {last_error}")
+    raise RuntimeError(f"All Gemini models failed: {last_error}")
 
 
 def _to_float(val) -> float:
@@ -156,8 +189,14 @@ def _fallback_data(confidence: int) -> dict:
 
 
 def compute_receipt_hash(data: dict) -> str:
-    """Generate a simple deterministic hash for duplicate detection."""
-    raw = f"{data.get('vendor')}|{data.get('total')}|{data.get('date')}"
+    """Generate a deterministic hash for duplicate detection.
+    Uses normalized vendor + total + date + invoice_number."""
+    
+    def norm(s):
+        return str(s).lower().strip().replace(" ", "")
+
+    # Create a string that ignores case/whitespace differences
+    raw = f"{norm(data.get('vendor', ''))}|{norm(data.get('total', ''))}|{norm(data.get('date', ''))}|{norm(data.get('invoice_number', ''))}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -178,6 +217,10 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
     """
     Triggered when a receipt image is uploaded to Firebase Storage.
     """
+    file_path = None
+    batch_id = None
+    receipt_id = None
+    
     try:
         if not firebase_admin._apps:
             initialize_app()
@@ -198,7 +241,18 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
         process_receipt_extraction(batch_id, receipt_id, bucket_name, file_path)
 
     except Exception as e:
-        print(f"[ERROR] on_receipt_upload failed: {str(e)}")
+        print(f"[ERROR] on_receipt_upload failed for {file_path}: {str(e)}")
+        # CRITICAL: Set error status so the receipt doesn't stay stuck
+        if batch_id and receipt_id:
+            try:
+                db = firestore.client()
+                db.collection("batches").document(batch_id).collection("receipts").document(receipt_id).set({
+                    "status": "error",
+                    "error_message": f"Upload trigger failed: {str(e)}",
+                    "processedAt": firestore.SERVER_TIMESTAMP  # type: ignore
+                }, merge=True)
+            except Exception as inner_e:
+                print(f"[ERROR] Could not set error status: {inner_e}")
 
 
 # ────────────────────────────────────────────────────────
@@ -211,8 +265,23 @@ def process_receipt_extraction(batch_id: str, receipt_id: str, bucket_name: str,
     """
     if not firebase_admin._apps: initialize_app()
     db = firestore.client()
+    
+    # Stagger: random 0-1s delay to spread simultaneous Gemini calls
+    stagger = random.uniform(0, 1.0)
+    print(f"[Process] Staggering {stagger:.1f}s before processing {receipt_id}")
+    time.sleep(stagger)
+    
     try:
         print(f"[Process] batch={batch_id} receipt={receipt_id} path={file_path}")
+
+        # Read batch doc for custom categories
+        batch_doc = db.collection("batches").document(batch_id).get()
+        custom_categories = None
+        if batch_doc.exists:
+            batch_data = batch_doc.to_dict()
+            custom_categories = batch_data.get("expenseCategories")
+            if custom_categories:
+                print(f"[Process] Using {len(custom_categories)} custom categories")
 
         # Download the image
         bucket = storage.bucket(bucket_name)
@@ -236,27 +305,43 @@ def process_receipt_extraction(batch_id: str, receipt_id: str, bucket_name: str,
                 reused_data = existing_data["extractedData"]
                 reused_data["source"] = "cache_hit"
                 
-                _finalize_extraction(db, batch_id, receipt_id, reused_data, image_hash_sha256)
+                # Check if this is a duplicate in the SAME batch
+                is_duplicate = False
+                duplicate_of = None
+                try:
+                    existing_ref = existing_docs[0].reference
+                    # reference -> collection(receipts) -> document(batch)
+                    existing_batch_id = existing_ref.parent.parent.id
+                    if existing_batch_id == batch_id:
+                        is_duplicate = True
+                        duplicate_of = existing_docs[0].id
+                        reused_data["flag_duplicate"] = True
+                except Exception as e:
+                    print(f"[Warning] Idempotency batch check failed: {e}")
+
+                _finalize_extraction(db, batch_id, receipt_id, reused_data, image_hash_sha256, is_duplicate=is_duplicate, duplicate_of=duplicate_of)
                 return
 
         # ── GEMINI EXTRACTION ────────────────────────────────────
-        extracted = extract_receipt_data(image_bytes)
+        extracted = extract_receipt_data(image_bytes, custom_categories)
         receipt_hash = compute_receipt_hash(extracted)
         
         # Duplicate detection within batch
         is_duplicate = False
+        duplicate_of = None
         try:
             batch_ref = db.collection("batches").document(batch_id).collection("receipts")
             existing_query = batch_ref.where(filter=FieldFilter("receipt_hash", "==", receipt_hash)).limit(2).stream()
             for doc in existing_query:
                 if doc.id != receipt_id:
                     is_duplicate = True
+                    duplicate_of = doc.id
                     break
         except Exception as q_err:
             print(f"[Warning] Duplicate check failed: {q_err}")
         
         extracted["flag_duplicate"] = is_duplicate
-        _finalize_extraction(db, batch_id, receipt_id, extracted, image_hash_sha256, receipt_hash)
+        _finalize_extraction(db, batch_id, receipt_id, extracted, image_hash_sha256, receipt_hash, is_duplicate, duplicate_of)
 
     except Exception as e:
         print(f"[ERROR] Extraction failed for {receipt_id}: {e}")
@@ -267,7 +352,7 @@ def process_receipt_extraction(batch_id: str, receipt_id: str, bucket_name: str,
         }, merge=True)
 
 
-def _finalize_extraction(db, batch_id: str, receipt_id: str, data: dict, img_hash: str, receipt_hash: str = ""):
+def _finalize_extraction(db, batch_id: str, receipt_id: str, data: dict, img_hash: str, receipt_hash: str = "", is_duplicate: bool = False, duplicate_of: Optional[str] = None):
     """Updates Firestore and increments batch count if not already done."""
     receipt_ref = db.collection("batches").document(batch_id).collection("receipts").document(receipt_id)
     
@@ -275,14 +360,23 @@ def _finalize_extraction(db, batch_id: str, receipt_id: str, data: dict, img_has
     snap = receipt_ref.get()
     was_extracted = snap.exists and snap.to_dict().get("extracted") is True
 
-    receipt_ref.set({
+    update_data = {
         "extracted": True,
         "extractedData": data,
         "receipt_hash": receipt_hash or data.get("receipt_hash", ""),
         "image_hash_sha256": img_hash,
         "processedAt": firestore.SERVER_TIMESTAMP,  # type: ignore
-        "status": "extracted"
-    }, merge=True)
+        "status": "extracted",
+        "flag_duplicate": is_duplicate,
+    }
+    
+    if duplicate_of:
+        update_data["duplicate_of"] = duplicate_of
+    
+    receipt_ref.set(update_data, merge=True)
+
+    if is_duplicate:
+        print(f"[Duplicate] Receipt {receipt_id} is a duplicate of {duplicate_of}")
 
     if not was_extracted:
         print(f"[Firestore] Incrementing count for batch {batch_id}")

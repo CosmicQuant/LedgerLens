@@ -353,6 +353,9 @@ def export_batch(req: https_fn.Request) -> https_fn.Response:
         export_path = f"exports/{batch_id}/{filename}"
         bucket = storage.bucket()
         blob = bucket.blob(export_path)
+        
+        # Set Content-Disposition so browsers download instead of displaying
+        blob.content_disposition = f'attachment; filename="{filename}"'
         blob.upload_from_string(
             excel_bytes,
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

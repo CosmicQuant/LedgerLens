@@ -2,8 +2,8 @@ import { state } from './state.js';
 import { showToast } from './ui.js';
 
 const MAX_WIDTH = 1500;
-const THUMB_WIDTH = 150; // Thumbnail width
-const JPEG_QUALITY = 0.8;
+const THUMB_WIDTH = 150;
+const COMPRESS_QUALITY = 0.8;
 
 // Reusable canvases
 const captureCanvas = document.createElement('canvas');
@@ -11,7 +11,59 @@ const captureCtx = captureCanvas.getContext('2d');
 const thumbCanvas = document.createElement('canvas');
 const thumbCtx = thumbCanvas.getContext('2d');
 
+// ── WebP Support Detection ──────────────────────────────
+// Safari < 16.4 doesn't support WebP canvas encoding.
+// toBlob('image/webp') silently returns null → broken uploads.
+let _preferredMime = null;
+
+function getPreferredMime() {
+    if (_preferredMime) return _preferredMime;
+
+    // Test if the browser can encode WebP via canvas
+    const testCanvas = document.createElement('canvas');
+    testCanvas.width = 1;
+    testCanvas.height = 1;
+    const dataUrl = testCanvas.toDataURL('image/webp');
+
+    if (dataUrl.startsWith('data:image/webp')) {
+        _preferredMime = 'image/webp';
+    } else {
+        _preferredMime = 'image/jpeg';
+        console.warn('[Camera] WebP encoding not supported. Falling back to JPEG.');
+    }
+    return _preferredMime;
+}
+
+/** Returns 'webp' or 'jpeg' — used for storage path extension */
+export function getFileExtension() {
+    return getPreferredMime() === 'image/webp' ? 'webp' : 'jpg';
+}
+
+// ── Wake Lock ────────────────────────────────────────────
 let isTorchOn = false;
+let wakeLock = null;
+
+async function requestWakeLock() {
+    try {
+        if ('wakeLock' in navigator) {
+            wakeLock = await navigator.wakeLock.request('screen');
+            wakeLock.addEventListener('release', () => { wakeLock = null; });
+            console.log('[WakeLock] Acquired');
+        }
+    } catch (e) {
+        console.warn('[WakeLock] Failed:', e.message);
+    }
+}
+
+function releaseWakeLock() {
+    if (wakeLock) {
+        wakeLock.release();
+        wakeLock = null;
+        console.log('[WakeLock] Released');
+    }
+}
+
+// ── Camera Control ───────────────────────────────────────
 
 export async function startCamera(videoElement, torchButton) {
     try {
@@ -50,6 +102,9 @@ export async function startCamera(videoElement, torchButton) {
         } catch (err) {
             console.error('Video play error:', err);
         }
+
+        // Prevent phone sleep
+        await requestWakeLock();
     } catch (err) {
         showToast('Camera access denied', 'error');
         console.error('Camera error:', err);
@@ -62,7 +117,10 @@ export function stopCamera(videoElement) {
         state.mediaStream = null;
         if (videoElement) videoElement.srcObject = null;
     }
+    releaseWakeLock();
 }
+
+// ── Frame Capture ────────────────────────────────────────
 
 export function captureFrame(videoElement) {
     if (!state.mediaStream) {
@@ -73,7 +131,6 @@ export function captureFrame(videoElement) {
     const track = state.mediaStream.getVideoTracks()[0];
     const settings = track.getSettings();
 
-    // Fallback if settings are missing (common on some devices)
     const videoWidth = videoElement.videoWidth || settings.width || 1280;
     const videoHeight = videoElement.videoHeight || settings.height || 720;
 
@@ -90,21 +147,31 @@ export function captureFrame(videoElement) {
         console.error("Canvas draw error:", err);
         return null;
     }
+
+    const mime = getPreferredMime();
     return new Promise(resolve => {
-        captureCanvas.toBlob(blob => resolve(blob), 'image/webp', JPEG_QUALITY);
+        captureCanvas.toBlob(blob => {
+            if (!blob || blob.size === 0) {
+                // Last-resort fallback to JPEG
+                console.warn('[Capture] Primary blob empty, falling back to JPEG');
+                captureCanvas.toBlob(fb => resolve(fb), 'image/jpeg', COMPRESS_QUALITY);
+            } else {
+                resolve(blob);
+            }
+        }, mime, COMPRESS_QUALITY);
     });
 }
 
-// NEW: Generate small thumbnail from either video or generic source (Blob/Image)
+// ── Thumbnail Generation ─────────────────────────────────
+
 export async function generateThumbnail(source, isVideo = true) {
     let sw, sh;
     if (isVideo) {
         sw = source.videoWidth;
         sh = source.videoHeight;
     } else {
-        // Assume source is an Image or another Canvas
-        sw = source.width;
-        sh = source.height;
+        sw = source.naturalWidth || source.width;
+        sh = source.naturalHeight || source.height;
     }
 
     if (!sw || !sh) return null;
@@ -123,14 +190,69 @@ export async function generateThumbnail(source, isVideo = true) {
         return null;
     }
 
+    const mime = getPreferredMime();
     return new Promise(resolve => {
-        thumbCanvas.toBlob(blob => resolve(blob), 'image/webp', 0.7);
+        thumbCanvas.toBlob(blob => {
+            if (!blob || blob.size === 0) {
+                thumbCanvas.toBlob(fb => resolve(fb), 'image/jpeg', 0.7);
+            } else {
+                resolve(blob);
+            }
+        }, mime, 0.7);
     });
 }
 
-/**
- * Creates an Image object from a Blob (helper for gallery thumbnails)
- */
+// ── Gallery Image Compression ────────────────────────────
+// Compresses raw gallery photos (e.g. 12MP iPhone → 1500px JPEG)
+// so they're the same size as camera captures before upload.
+
+export async function compressImage(file) {
+    const img = await blobToImage(file);
+
+    const sw = img.naturalWidth || img.width;
+    const sh = img.naturalHeight || img.height;
+
+    // Only downscale if wider than MAX_WIDTH
+    let targetW = sw;
+    let targetH = sh;
+    if (sw > MAX_WIDTH) {
+        const scale = MAX_WIDTH / sw;
+        targetW = MAX_WIDTH;
+        targetH = Math.round(sh * scale);
+    }
+
+    captureCanvas.width = targetW;
+    captureCanvas.height = targetH;
+
+    try {
+        captureCtx.drawImage(img, 0, 0, targetW, targetH);
+    } catch (err) {
+        console.error('[Compress] Canvas draw error:', err);
+        URL.revokeObjectURL(img.src);
+        return file; // Return original on failure
+    }
+
+    URL.revokeObjectURL(img.src);
+
+    const mime = getPreferredMime();
+    return new Promise(resolve => {
+        captureCanvas.toBlob(blob => {
+            if (!blob || blob.size === 0) {
+                // Fallback to JPEG
+                captureCanvas.toBlob(fb => {
+                    resolve(fb || file);
+                }, 'image/jpeg', COMPRESS_QUALITY);
+            } else {
+                const savings = ((1 - blob.size / file.size) * 100).toFixed(0);
+                console.log(`[Compress] ${(file.size / 1024).toFixed(0)}KB → ${(blob.size / 1024).toFixed(0)}KB (${savings}% saved)`);
+                resolve(blob);
+            }
+        }, mime, COMPRESS_QUALITY);
+    });
+}
+
+// ── Helpers ──────────────────────────────────────────────
+
 export function blobToImage(blob) {
     return new Promise((resolve, reject) => {
         const img = new Image();

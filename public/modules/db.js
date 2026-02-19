@@ -38,5 +38,14 @@ export async function deleteReceiptFromIDB(id) {
 export async function getPendingUploads(batchId) {
     const database = await getIDB();
     let pending = await database.getAllFromIndex(STORE_NAME, 'status', 'pending_upload');
+
+    // Recover receipts stuck in 'uploading' (e.g. app crashed mid-upload)
+    const stuck = await database.getAllFromIndex(STORE_NAME, 'status', 'uploading');
+    for (const r of stuck) {
+        r.status = 'pending_upload';
+        await database.put(STORE_NAME, r);
+    }
+    pending = pending.concat(stuck);
+
     return pending.filter(r => r.batchId === batchId);
 }

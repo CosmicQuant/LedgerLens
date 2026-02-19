@@ -72,8 +72,12 @@
                     <input type="text" id="input-client" placeholder="e.g. Acme Corp" required />
                 </div>
                 <div class="input-group">
-                    <label for="input-cycle">Audit Cycle</label>
-                    <input type="text" id="input-cycle" placeholder="e.g. Q4-2025 Annual" required />
+                    <label for="input-categories">Expense Categories <span
+                            style="opacity:.5;font-weight:400">(optional)</span></label>
+                    <textarea id="input-categories" rows="3"
+                        placeholder="e.g. Fuel, Repairs, Salaries, Rent, Utilities&#10;Leave blank to use defaults"></textarea>
+                    <small class="input-hint">Comma-separated. Defaults: Food &amp; Beverage, Office Supplies, Travel,
+                        Fuel, Utilities, Medical, Equipment, Services</small>
                 </div>
                 <button type="submit" id="btn-start" class="btn-primary">
                     <span class="material-symbols-rounded">play_arrow</span>
@@ -109,9 +113,11 @@
                 </div>
             </div>
             <div class="bar-right">
-                <div class="counter-pill" id="counter-pill">
+                <div class="usage-meter" id="usage-meter">
                     <span class="material-symbols-rounded">photo_camera</span>
                     <span id="snap-count">0</span>
+                    <span class="usage-divider">/</span>
+                    <span class="usage-limit">100</span>
                 </div>
                 <button id="btn-torch" class="btn-icon hidden" aria-label="Toggle Flashlight">
                     <span class="material-symbols-rounded">flash_on</span>
@@ -134,14 +140,14 @@
             <div id="flash-fx" class="flash-fx"></div>
         </div>
 
-        <!-- NEW: Control Deck Wrapper -->
+        <!-- Control Deck: stacks vertically below the viewfinder -->
         <div class="control-deck">
             <!-- Thumbnail Queue -->
             <div id="queue-strip">
                 <div id="queue-list" class="queue-list"></div>
             </div>
 
-            <!-- Main Actions Row -->
+            <!-- Capture Row: Gallery | Shutter | (placeholder for symmetry) -->
             <div id="shutter-area">
                 <button id="btn-gallery" class="btn-icon-pill" aria-label="Bulk Upload">
                     <span class="material-symbols-rounded">photo_library</span>
@@ -151,15 +157,19 @@
                     <span class="shutter-ring"></span>
                 </button>
 
-                <!-- Moved Finish Button here for the 3-column layout -->
-                <div id="bottom-actions">
-                    <button id="btn-finish" class="btn-finish" disabled aria-label="Finish Batch">
-                        <span class="material-symbols-rounded">check</span>
-                    </button>
-                    <button id="btn-export" class="btn-export" style="display:none;" aria-label="Export Excel">
-                        <span class="material-symbols-rounded">ios_share</span>
-                    </button>
-                </div>
+                <div style="width:48px;"></div><!-- spacer for 3-col symmetry -->
+            </div>
+
+            <!-- Action Bar: Finish / Export -->
+            <div id="bottom-actions">
+                <button id="btn-finish" class="btn-finish" disabled>
+                    <span class="material-symbols-rounded">check_circle</span>
+                    Finish Batch
+                </button>
+                <button id="btn-export" class="btn-export" style="display:none;">
+                    <span class="material-symbols-rounded">ios_share</span>
+                    Export Excel
+                </button>
             </div>
         </div>
 

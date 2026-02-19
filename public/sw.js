@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ledgerlens-v15';
+const CACHE_NAME = 'ledgerlens-v29';
 const ASSETS = [
     '/',
     '/index.html',
@@ -7,6 +7,7 @@ const ASSETS = [
     '/modules/config.js',
     '/modules/firebase-init.js',
     '/modules/state.js',
+    '/modules/batch-state.js',
     '/modules/db.js',
     '/modules/camera.js',
     '/modules/ui.js',
@@ -18,6 +19,8 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (event) => {
+    // Skip waiting so the new SW activates IMMEDIATELY
+    self.skipWaiting();
     event.waitUntil(
         caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
     );
@@ -32,16 +35,27 @@ self.addEventListener('fetch', (event) => {
     }
 
     event.respondWith(
-        caches.match(event.request).then((response) => {
-            return response || fetch(event.request);
-        })
+        // Network-first: try network, fall back to cache
+        fetch(event.request)
+            .then((response) => {
+                // Cache the fresh response for offline use
+                if (response.ok) {
+                    const clone = response.clone();
+                    caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
+                }
+                return response;
+            })
+            .catch(() => caches.match(event.request))
     );
 });
 
 self.addEventListener('activate', (event) => {
+    // Claim all clients so the new SW controls them immediately
     event.waitUntil(
-        caches.keys().then((keys) => Promise.all(
-            keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
-        ))
+        caches.keys()
+            .then((keys) => Promise.all(
+                keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
+            ))
+            .then(() => self.clients.claim())
     );
 });

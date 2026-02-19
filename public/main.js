@@ -1,10 +1,19 @@
 import { state } from './modules/state.js';
 import { db, auth, storage } from './modules/firebase-init.js';
-import { startCamera, stopCamera, captureFrame, generateThumbnail, blobToImage } from './modules/camera.js';
+import { startCamera, stopCamera, captureFrame, generateThumbnail, blobToImage, compressImage } from './modules/camera.js';
 import { getIDB, saveReceiptToIDB, deleteReceiptFromIDB } from './modules/db.js';
-import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, updateThumbnailStatus, setBatchCompleted } from './modules/ui.js';
+import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, updateThumbnailStatus, setBatchCompleted, updateUsageMeter } from './modules/ui.js';
 import { uploadPending, scheduleUpload } from './modules/sync.js';
 import { uid, sanitizeInput } from './modules/utils.js';
+import { batchState } from './modules/batch-state.js';
+
+// ────────────────────────────────────────────────────────
+// BatchStateManager → UI Binding
+// ────────────────────────────────────────────────────────
+batchState.subscribe((payload) => {
+  updateUsageMeter(payload);
+  updateFinishButton(payload.totalCount, payload.pendingCount);
+});
 
 // ────────────────────────────────────────────────────────
 // Session Management
@@ -31,6 +40,7 @@ async function tryRestoreSession() {
 
     state.setClientName(sess.clientName);
     state.setBatchId(sess.batchId);
+    batchState.init(sess.batchId, db);
 
     DOM.lblClient.textContent = state.clientName;
     DOM.lblBatch.textContent = `Batch ${state.batchId.slice(0, 8)}…`;
@@ -50,29 +60,29 @@ async function tryRestoreSession() {
 
     const all = [...localReceipts, ...remoteReceipts];
 
-    // Safer Sort: Handle mixed Timestamp/Number/Null
+    // Sort: Handle mixed Timestamp/Number/Null
     const getTs = (r) => {
       if (r.createdAt) return r.createdAt;
       if (r.uploadedAt) {
         if (typeof r.uploadedAt.toMillis === 'function') return r.uploadedAt.toMillis();
-        return r.uploadedAt; // probably a raw number
+        return r.uploadedAt;
       }
       return 0;
     };
     all.sort((a, b) => getTs(b) - getTs(a));
 
-    state.snapCounter = all.length;
     DOM.queueList.innerHTML = '';
+    state.pendingCount = 0;
 
     for (const r of all) {
       if (r.status === 'pending_upload' || r.status === 'uploading') state.pendingCount++;
 
       let thumbUrl;
-      if (r.blob) {
-        thumbUrl = URL.createObjectURL(r.blob);
-        state.activeObjectURLs.set(r.id, thumbUrl);
-      } else if (r.thumbBlob) {
+      if (r.thumbBlob) {
         thumbUrl = URL.createObjectURL(r.thumbBlob);
+        state.activeObjectURLs.set(r.id, thumbUrl);
+      } else if (r.blob) {
+        thumbUrl = URL.createObjectURL(r.blob);
         state.activeObjectURLs.set(r.id, thumbUrl);
       } else if (r.storageUrl) {
         thumbUrl = r.storageUrl;
@@ -86,7 +96,9 @@ async function tryRestoreSession() {
       addThumbnailToQueue(r.id, thumbUrl, effectiveStatus, firestoreData, deleteReceipt);
     }
 
-    DOM.snapCount.textContent = state.snapCounter;
+    // Use BatchStateManager for authoritative count
+    await batchState.recalculate();
+
     showScreen(DOM.camera);
     setBatchCompleted(sess.status === 'completed');
 
@@ -94,7 +106,6 @@ async function tryRestoreSession() {
       history.pushState({ screen: 'camera' }, 'Camera', '#camera');
     }
 
-    // Camera initialization should NOT kill the whole restoration if it fails
     try {
       await startCamera(DOM.video, DOM.btnTorch);
     } catch (camErr) {
@@ -103,13 +114,10 @@ async function tryRestoreSession() {
     }
 
     uploadPending();
-    // Proactive check for stuck AI after restoration
     setTimeout(() => checkAndTriggerRetries(), 2000);
     return true;
   } catch (e) {
     console.warn('Session restore failed:', e);
-    // Don't remove session immediately if it's a network error? 
-    // But for now, let's keep it to prevent infinite redirect loops
     localStorage.removeItem('ledgerlens_session');
     return false;
   }
@@ -121,6 +129,7 @@ function resetApp(isPopState = false) {
   if (confirm('Exit current batch? Unsynced images will be kept in history.')) {
     stopCamera(DOM.video);
     state.reset();
+    batchState.reset();
     showScreen(DOM.setup);
     DOM.queueList.innerHTML = '<span class="queue-empty">Snap a receipt to begin</span>';
     setBatchCompleted(false);
@@ -157,37 +166,46 @@ DOM.formSetup.addEventListener('submit', async (e) => {
   e.preventDefault();
 
   const cName = sanitizeInput(DOM.inputClient.value);
-  const cycle = sanitizeInput(DOM.inputCycle.value);
+  const rawCategories = (DOM.inputCategories.value || '').trim();
 
-  if (!cName || !cycle) {
-    showToast('Please enter valid names', 'error');
+  if (!cName) {
+    showToast('Please enter a company name', 'error');
     return;
   }
 
+  // Parse comma-separated categories into array (filter empty)
+  const customCategories = rawCategories
+    ? rawCategories.split(',').map(c => c.trim()).filter(c => c.length > 0)
+    : null;
+
   state.setClientName(cName);
-  const newBatchId = `${cName.replace(/\s+/g, '_')}_${cycle.replace(/\s+/g, '_')}_${uid()}`;
+  const newBatchId = `${cName.replace(/\s+/g, '_')}_${uid()}`;
   state.setBatchId(newBatchId);
+  batchState.init(newBatchId, db);
 
   saveSession();
 
   // Clear UI
   DOM.queueList.innerHTML = '';
-  state.snapCounter = 0;
   state.pendingCount = 0;
-  DOM.snapCount.textContent = '0';
+  batchState.reset();
+  batchState.init(newBatchId, db);
   setBatchCompleted(false);
-  DOM.btnFinish.disabled = true;
 
   // Create batch in Firestore
   try {
-    await db.collection('batches').doc(newBatchId).set({
+    const batchDoc = {
       clientName: cName,
-      auditCycle: cycle,
       ownerId: state.currentUser.uid,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       status: 'active',
       receiptCount: 0
-    });
+    };
+    // Only store custom categories if provided
+    if (customCategories && customCategories.length > 0) {
+      batchDoc.expenseCategories = customCategories;
+    }
+    await db.collection('batches').doc(newBatchId).set(batchDoc);
   } catch (err) {
     console.warn('Firestore batch create deferred (offline):', err);
   }
@@ -203,23 +221,34 @@ DOM.formSetup.addEventListener('submit', async (e) => {
   showToast(`Batch started for ${cName}`, 'success');
 });
 
+const BATCH_MAX_IMAGES = 100;
+const MAX_GALLERY_UPLOAD = 20;
+
 // Snap Button
 if (DOM.btnSnap) {
   DOM.btnSnap.onclick = async () => {
-    if (state.snapCounter >= BATCH_MAX_IMAGES) {
-      showToast('Batch limit reached', 'error');
+    if (batchState.isAtLimit) {
+      showToast('Batch Limit Reached. Please Finish this batch.', 'error');
+      return;
+    }
+
+    // 1. Capture Full Image
+    const fullBlob = await captureFrame(DOM.video);
+    if (!fullBlob) {
+      showToast('Capture failed — please try again', 'error');
       return;
     }
 
     const receiptId = uid();
-    state.incrementSnap();
     state.pendingCount++;
-    DOM.snapCount.textContent = state.snapCounter;
 
-    // 1. Capture Full Image
-    const fullBlob = await captureFrame(DOM.video);
-    // 2. Capture/Generate Thumbnail
-    const thumbBlob = await generateThumbnail(DOM.video, true);
+    // 2. Capture/Generate Thumbnail (non-fatal)
+    let thumbBlob = null;
+    try {
+      thumbBlob = await generateThumbnail(DOM.video, true);
+    } catch (e) {
+      console.warn('Thumbnail generation failed, using full blob:', e);
+    }
 
     // Save to IDB
     await saveReceiptToIDB({
@@ -236,12 +265,11 @@ if (DOM.btnSnap) {
     state.activeObjectURLs.set(receiptId, thumbUrl);
     addThumbnailToQueue(receiptId, thumbUrl, 'pending_upload', null, deleteReceipt);
 
-    updateFinishButton();
+    // Notify BatchStateManager (optimistic + async recount)
+    batchState.notifyChange();
     uploadPending();
   };
 }
-const BATCH_MAX_IMAGES = 100;
-const MAX_GALLERY_UPLOAD = 20; // New limit for gallery uploads
 
 // Gallery Button
 const $btnGallery = document.getElementById('btn-gallery');
@@ -258,62 +286,91 @@ if ($inputBulk) {
     const files = Array.from(e.target.files);
     if (!files.length) return;
 
-    // Limit Check
+    // Per-selection limit
     if (files.length > MAX_GALLERY_UPLOAD) {
       showToast(`Please select up to ${MAX_GALLERY_UPLOAD} images at a time.`, 'error');
       $inputBulk.value = '';
       return;
     }
 
-    if (state.snapCounter + files.length > BATCH_MAX_IMAGES) {
-      showToast(`Cannot add ${files.length} images. Batch limit is ${BATCH_MAX_IMAGES}.`, 'error');
+    // Batch limit check
+    const remaining = batchState.remaining;
+    if (files.length > remaining) {
+      showToast(`Cannot add ${files.length} images. Only ${remaining} slots remaining.`, 'error');
       $inputBulk.value = '';
       return;
     }
 
-    $inputBulk.value = ''; // Reset for next selection
+    $inputBulk.value = '';
     handleBulkUpload(files);
   });
 }
 
 async function handleBulkUpload(files) {
   showToast(`Processing ${files.length} images…`, 'info');
+  let added = 0;
 
   for (const file of files) {
-    if (state.snapCounter >= BATCH_MAX_IMAGES) break;
+    if (batchState.isAtLimit) break;
 
-    const receiptId = uid();
-    state.incrementSnap();
-    state.pendingCount++;
-    DOM.snapCount.textContent = state.snapCounter;
-
-    // Generate Thumbnail for the gallery image
-    let thumbBlob = null;
     try {
-      const img = await blobToImage(file);
-      thumbBlob = await generateThumbnail(img, false);
-      URL.revokeObjectURL(img.src); // Cleanup temp URL
-    } catch (e) {
-      console.warn("Gallery thumbnail generation failed:", e);
+      const receiptId = uid();
+      state.pendingCount++;
+
+      // Compress raw gallery image (e.g. 12MP iPhone → 1500px)
+      // Same quality as camera captures — critical for iPhone/Safari
+      let compressedBlob;
+      try {
+        compressedBlob = await compressImage(file);
+      } catch (e) {
+        console.warn('Compression failed, using original:', e);
+        compressedBlob = file;
+      }
+
+      // Generate Thumbnail (non-fatal)
+      let thumbBlob = null;
+      try {
+        const img = await blobToImage(compressedBlob);
+        thumbBlob = await generateThumbnail(img, false);
+        URL.revokeObjectURL(img.src);
+      } catch (e) {
+        console.warn('Gallery thumbnail generation failed:', e);
+      }
+
+      // Save compressed blob to IDB (not raw file)
+      await saveReceiptToIDB({
+        id: receiptId,
+        batchId: state.batchId,
+        blob: compressedBlob,
+        thumbBlob: thumbBlob,
+        status: 'pending_upload',
+        createdAt: Date.now()
+      });
+
+      // Add to UI (prefer thumbBlob for queue)
+      const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(file);
+      state.activeObjectURLs.set(receiptId, displayUrl);
+      addThumbnailToQueue(receiptId, displayUrl, 'pending_upload', null, deleteReceipt);
+      added++;
+
+      // Optimistic update per file
+      batchState.notifyChange();
+
+      // Yield to UI thread every file to prevent freeze
+      await new Promise(r => setTimeout(r, 50));
+    } catch (err) {
+      console.error('Failed to add gallery image:', err);
+      showToast(`Failed to add image: ${err.message}`, 'error');
     }
-
-    // Save to IDB
-    await saveReceiptToIDB({
-      id: receiptId,
-      batchId: state.batchId,
-      blob: file,
-      thumbBlob: thumbBlob,
-      status: 'pending_upload',
-      createdAt: Date.now()
-    });
-
-    // Add to UI (prefer thumbBlob for queue)
-    const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(file);
-    state.activeObjectURLs.set(receiptId, displayUrl);
-    addThumbnailToQueue(receiptId, displayUrl, 'pending_upload', null, deleteReceipt);
   }
 
-  updateFinishButton();
+  if (batchState.isAtLimit) {
+    showToast(`Batch limit reached (${batchState.totalCount}/${batchState.limit})`, 'warning');
+  }
+
+  if (added > 0) {
+    showToast(`${added} receipt(s) added`, 'success');
+  }
   uploadPending();
 }
 
@@ -338,8 +395,7 @@ async function deleteReceipt(id) {
     }
     if (card) card.remove();
 
-    state.decrementSnap();
-    DOM.snapCount.textContent = state.snapCounter;
+    batchState.notifyDelete();
     showToast('Receipt deleted', 'info');
 
     if (DOM.queueList.children.length === 0) {
@@ -359,7 +415,7 @@ DOM.btnFinish.addEventListener('click', async () => {
     await db.collection('batches').doc(state.batchId).update({
       status: 'completed',
       completedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      totalReceipts: state.snapCounter
+      totalReceipts: batchState.totalCount
     });
     saveSession('completed');
     showToast('Batch completed ✓', 'success');
@@ -394,8 +450,27 @@ if (DOM.btnExport) {
 
       const result = await response.json();
       if (result.download_url) {
-        window.open(result.download_url, '_blank');
-        showToast('Excel report ready!', 'success');
+        showToast('Excel report ready! Downloading…', 'success');
+
+        // Safari/iOS blocks target=_blank and link.click() in async callbacks.
+        // Use window.location.href for maximum compatibility — the Firebase
+        // Storage URL returns Content-Disposition: attachment, so it downloads
+        // instead of navigating away.
+        const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+
+        if (isSafari) {
+          // Safari: direct navigation (won't leave page for file downloads)
+          window.location.href = result.download_url;
+        } else {
+          // Chrome/Firefox: hidden link with download attribute
+          const link = document.createElement('a');
+          link.href = result.download_url;
+          link.download = `LedgerLens_Report.xlsx`;
+          link.rel = 'noopener';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
       }
     } catch (err) {
       showToast('Export failed: ' + err.message, 'error');
@@ -523,12 +598,15 @@ async function showHistory() {
     snap.forEach(doc => {
       const b = doc.data();
       const date = b.createdAt ? b.createdAt.toDate().toLocaleDateString() : 'Unknown';
+      const catInfo = b.expenseCategories
+        ? `${b.expenseCategories.length} custom categories`
+        : (b.auditCycle || 'Default categories');
       const item = document.createElement('div');
       item.className = 'history-item';
       item.innerHTML = `
                 <div class="info">
                     <strong>${b.clientName || 'Unnamed'}</strong>
-                    <span>${b.auditCycle || ''} • ${date} • <b>${b.receiptCount || 0} receipts</b></span>
+                    <span>${catInfo} &bull; ${date} &bull; <b>${b.uploadedCount || b.receiptCount || 0} receipts</b></span>
                 </div>
                 <div class="actions">
                     <button class="btn-restore">Restore</button>
@@ -661,7 +739,7 @@ cameraObserver.observe(DOM.camera, { attributes: true, attributeFilter: ['class'
 let autoRetryInterval = null;
 function startAutoRetryCheck() {
   if (autoRetryInterval) return;
-  autoRetryInterval = setInterval(() => checkAndTriggerRetries(), 30000);
+  autoRetryInterval = setInterval(() => checkAndTriggerRetries(), 10000);
 }
 
 async function checkAndTriggerRetries() {
@@ -674,13 +752,14 @@ async function checkAndTriggerRetries() {
     const data = card._firestoreData;
     if (!data) continue;
 
-    const isStuckState = data.status === 'synced' || data.status === 'uploaded' || data.status === 'processing';
+    const isStuckState = data.status === 'synced' || data.status === 'uploaded' || data.status === 'processing' || data.status === 'error';
     if (!isStuckState || data.extracted === true) continue;
 
-    const uploadedTime = data.uploadedAt ? data.uploadedAt.toMillis() : (data.createdAt || now);
+    const uploadedTime = data.uploadedAt ? (typeof data.uploadedAt.toMillis === 'function' ? data.uploadedAt.toMillis() : data.uploadedAt) : (data.createdAt || now);
     const diffMs = now - uploadedTime;
 
-    if (diffMs > 120000 && data.status !== 'pending_retry') {
+    // Retry after 20s stuck (reduced from 60s for speed)
+    if (diffMs > 20000 && data.status !== 'pending_retry') {
       const id = card.id.replace('q-', '');
       console.log(`[Auto-Retry] Triggering for ${id} (Stuck for ${Math.round(diffMs / 1000)}s)`);
 
