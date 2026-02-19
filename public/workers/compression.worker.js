@@ -9,7 +9,8 @@ self.onmessage = async (e) => {
 
     try {
         // 1. Create ImageBitmap (efficient decoding)
-        const bitmap = await createImageBitmap(file);
+        // If file is already ImageBitmap, this clones it (fast)
+        const bitmap = file instanceof ImageBitmap ? file : await createImageBitmap(file);
 
         // 2. Calculate dimensions
         let width = bitmap.width;

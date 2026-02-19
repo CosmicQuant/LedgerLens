@@ -122,44 +122,53 @@ export function stopCamera(videoElement) {
 
 // ── Frame Capture ────────────────────────────────────────
 
-export function captureFrame(videoElement) {
+export async function captureFrame(videoElement) {
     if (!state.mediaStream) {
         console.error("No media stream available for capture");
         return null;
     }
 
-    const track = state.mediaStream.getVideoTracks()[0];
-    const settings = track.getSettings();
-
-    const videoWidth = videoElement.videoWidth || settings.width || 1280;
-    const videoHeight = videoElement.videoHeight || settings.height || 720;
-
-    const targetW = MAX_WIDTH;
-    const scale = targetW / videoWidth;
-    const targetH = videoHeight * scale;
-
-    captureCanvas.width = targetW;
-    captureCanvas.height = targetH;
-
     try {
+        // ── WORKER PATH (Fastest) ──────────────────────────
+        // Zero-copy transfer if supported by browser
+        if (workerPool.length > 0 && typeof createImageBitmap === 'function') {
+            const bitmap = await createImageBitmap(videoElement);
+            // Offload compression to worker
+            // Note: We use the same compressor, which handles sizing & quality
+            return await compressImageWorker(bitmap);
+        }
+
+        // ── FALLBACK PATH (Main Thread) ────────────────────
+        const track = state.mediaStream.getVideoTracks()[0];
+        const settings = track.getSettings();
+
+        const videoWidth = videoElement.videoWidth || settings.width || 1280;
+        const videoHeight = videoElement.videoHeight || settings.height || 720;
+
+        const targetW = MAX_WIDTH;
+        const scale = targetW / videoWidth;
+        const targetH = videoHeight * scale;
+
+        captureCanvas.width = targetW;
+        captureCanvas.height = targetH;
+
         captureCtx.drawImage(videoElement, 0, 0, targetW, targetH);
+
+        const mime = getPreferredMime();
+        return new Promise(resolve => {
+            captureCanvas.toBlob(blob => {
+                if (!blob || blob.size === 0) {
+                    captureCanvas.toBlob(fb => resolve(fb), 'image/jpeg', COMPRESS_QUALITY);
+                } else {
+                    resolve(blob);
+                }
+            }, mime, COMPRESS_QUALITY);
+        });
+
     } catch (err) {
-        console.error("Canvas draw error:", err);
+        console.error("Capture error:", err);
         return null;
     }
-
-    const mime = getPreferredMime();
-    return new Promise(resolve => {
-        captureCanvas.toBlob(blob => {
-            if (!blob || blob.size === 0) {
-                // Last-resort fallback to JPEG
-                console.warn('[Capture] Primary blob empty, falling back to JPEG');
-                captureCanvas.toBlob(fb => resolve(fb), 'image/jpeg', COMPRESS_QUALITY);
-            } else {
-                resolve(blob);
-            }
-        }, mime, COMPRESS_QUALITY);
-    });
 }
 
 // ── Thumbnail Generation ─────────────────────────────────

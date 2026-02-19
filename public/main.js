@@ -6,6 +6,7 @@ import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, up
 import { uploadPending, scheduleUpload } from './modules/sync.js';
 import { uid, sanitizeInput } from './modules/utils.js';
 import { batchState } from './modules/batch-state.js';
+import { startWatchdog, stopWatchdog } from './modules/watchdog.js';
 
 // ────────────────────────────────────────────────────────
 // BatchStateManager → UI Binding
@@ -128,6 +129,7 @@ function resetApp(isPopState = false) {
 
   if (confirm('Exit current batch? Unsynced images will be kept in history.')) {
     stopCamera(DOM.video);
+    stopWatchdog();
     state.reset();
     batchState.reset();
     showScreen(DOM.setup);
@@ -224,6 +226,11 @@ DOM.formSetup.addEventListener('submit', async (e) => {
 
     showScreen(DOM.camera);
     await startCamera(DOM.video, DOM.btnTorch);
+
+    // Start Listeners
+    startExtractionListener();
+    startWatchdog();
+
     showToast(`Batch started for ${cName}`, 'success');
   } catch (err) {
     showToast(`Setup failed: ${err.message}`, 'error');
@@ -552,6 +559,7 @@ async function ensureAuth() {
 
         if (restored) {
           startExtractionListener();
+          startWatchdog();
         } else if (window.location.hash === '#camera') {
           // If hash is #camera but session failed, go to setup
           showScreen(DOM.setup);
