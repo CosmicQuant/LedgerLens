@@ -63,6 +63,8 @@ def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
     """
 
     # ── 1. Fetch batch metadata ──────────────────────────
+    # ── 1. Fetch batch metadata ──────────────────────────
+    # Lazy import to speed up cold start
     import pandas as pd
     import xlsxwriter
 

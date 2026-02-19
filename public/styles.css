@@ -247,6 +247,10 @@ body {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
 }
 
+.input-group {
+  margin-bottom: 24px;
+}
+
 .input-group label {
   display: block;
   font-size: 12px;
@@ -1408,6 +1412,36 @@ body {
     filter: drop-shadow(0 0 16px var(--accent-glow));
     color: var(--accent);
   }
+}
+
+/* Badge: Duplicate (New) */
+.badge-duplicate {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  background: #ff9800;
+  /* Orange */
+  color: #fff;
+  font-size: 9px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  display: none;
+  font-weight: 700;
+  z-index: 4;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.q-card.duplicate .badge-duplicate {
+  display: block;
+}
+
+.q-card.duplicate .q-card-inner {
+  border-color: #ff9800;
+}
+
+/* Override processing badge */
+.q-card.duplicate .badge-proc {
+  display: none !important;
 }
 
 .logo-icon {

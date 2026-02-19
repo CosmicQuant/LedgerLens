@@ -366,7 +366,7 @@ def _finalize_extraction(db, batch_id: str, receipt_id: str, data: dict, img_has
         "receipt_hash": receipt_hash or data.get("receipt_hash", ""),
         "image_hash_sha256": img_hash,
         "processedAt": firestore.SERVER_TIMESTAMP,  # type: ignore
-        "status": "extracted",
+        "status": "duplicate" if is_duplicate else "extracted",
         "flag_duplicate": is_duplicate,
     }
     

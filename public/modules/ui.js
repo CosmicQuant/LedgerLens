@@ -289,7 +289,7 @@ export function updateThumbnailStatus(id, status, firestoreData, uploadProgress)
     const hasError = status === 'error' || (firestoreData && firestoreData.status === 'error');
     const isInvalid = firestoreData && firestoreData.extractedData && firestoreData.extractedData.category === 'Invalid';
 
-    if (!isActuallyExtracted && !hasError && !isInvalid && (status === 'synced' || status === 'uploaded' || status === 'uploading' || status === 'pending_retry' || status === 'processing')) {
+    if (!isActuallyExtracted && !hasError && !isInvalid && !card.classList.contains('duplicate') && (status === 'synced' || status === 'uploaded' || status === 'uploading' || status === 'pending_retry' || status === 'processing')) {
         card.classList.add('is-processing');
 
         // Granular Labels (New Feature)
@@ -301,6 +301,12 @@ export function updateThumbnailStatus(id, status, firestoreData, uploadProgress)
             else if (status === 'pending_retry') badgeProc.textContent = 'Retrying...';
             else badgeProc.textContent = 'AI Processing...';
         }
+    }
+
+    // Force duplicate class if flagged (overrides others)
+    if ((firestoreData && firestoreData.flag_duplicate) || status === 'duplicate') {
+        card.classList.add('duplicate');
+        card.classList.remove('is-processing', 'extracted', 'synced');
     }
 
     if (isInvalid || hasError) {
@@ -364,7 +370,13 @@ export async function openPreview(id, thumbUrl, firestoreData) {
     try {
         const docSnap = await firestore.collection('batches').doc(state.batchId)
             .collection('receipts').doc(id).get();
-        if (docSnap.exists) data = docSnap.data();
+        if (docSnap.exists) {
+            data = docSnap.data();
+            // Upgrade to high-res if available and not using local blob
+            if (data.storageUrl && !rec) {
+                DOM.modalImg.src = data.storageUrl;
+            }
+        }
     } catch (e) { /* offline */ }
 
     DOM.modalData.textContent = '';

@@ -108,6 +108,18 @@ async function runPool(items, worker, limit) {
 async function uploadSingleReceipt(receipt) {
     const id = receipt.id;
 
+    // Retry Helper
+    const retryOperation = async (fn, retries = 3, delay = 1000) => {
+        try {
+            return await fn();
+        } catch (err) {
+            if (retries <= 0) throw err;
+            console.warn(`[Sync] Retry ${id} in ${delay}ms...`, err.message);
+            await new Promise(r => setTimeout(r, delay));
+            return retryOperation(fn, retries - 1, delay * 2);
+        }
+    };
+
     try {
         // 1. Mark uploading in IDB
         receipt.status = 'uploading';
@@ -119,33 +131,37 @@ async function uploadSingleReceipt(receipt) {
         const mimeType = ext === 'webp' ? 'image/webp' : 'image/jpeg';
         const storagePath = `receipts/${state.batchId}/${id}.${ext}`;
         const ref = storage.ref(storagePath);
-        const task = ref.put(receipt.blob, { contentType: mimeType });
 
-        await new Promise((resolve, reject) => {
-            task.on('state_changed',
-                (snapshot) => {
-                    const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-                    updateThumbnailStatus(id, 'uploading', null, progress);
-                },
-                (error) => reject(error),
-                () => resolve()
-            );
+        const downloadUrl = await retryOperation(async () => {
+            const task = ref.put(receipt.blob, { contentType: mimeType });
+
+            await new Promise((resolve, reject) => {
+                task.on('state_changed',
+                    (snapshot) => {
+                        const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+                        updateThumbnailStatus(id, 'uploading', null, progress);
+                    },
+                    (error) => reject(error),
+                    () => resolve()
+                );
+            });
+            // Verify upload success by getting URL immediately
+            return await task.snapshot.ref.getDownloadURL();
         });
 
-        // 3. Get download URL
-        const downloadUrl = await task.snapshot.ref.getDownloadURL();
-
         // 4. Write metadata to Firestore (triggers Cloud Function)
-        await firestore.collection('batches').doc(state.batchId)
-            .collection('receipts').doc(id).set({
-                storageUrl: downloadUrl,
-                storagePath: storagePath,
-                file_path: storagePath,
-                file_extension: ext,
-                status: 'synced',
-                extracted: false,
-                uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
-            });
+        await retryOperation(async () => {
+            await firestore.collection('batches').doc(state.batchId)
+                .collection('receipts').doc(id).set({
+                    storageUrl: downloadUrl,
+                    storagePath: storagePath,
+                    file_path: storagePath,
+                    file_extension: ext,
+                    status: 'synced',
+                    extracted: false,
+                    uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
+                });
+        }, 3, 1000);
 
         // Increment upload count (for accurate history)
         await firestore.collection('batches').doc(state.batchId).update({
@@ -173,7 +189,7 @@ async function uploadSingleReceipt(receipt) {
         console.log(`[Sync] ✓ ${id} uploaded`);
 
     } catch (err) {
-        console.error(`[Sync] ✗ ${id} failed:`, err);
+        console.error(`[Sync] ✗ ${id} failed after retries:`, err);
 
         // Mark as pending for retry on next cycle (don't block others)
         receipt.status = 'pending_upload';

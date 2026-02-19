@@ -203,10 +203,62 @@ export async function generateThumbnail(source, isVideo = true) {
 }
 
 // ── Gallery Image Compression ────────────────────────────
-// Compresses raw gallery photos (e.g. 12MP iPhone → 1500px JPEG)
-// so they're the same size as camera captures before upload.
+
+/* Worker Pool by LedgerLens - 2 Parallel Workers */
+const WORKER_COUNT = 2;
+const workerPool = [];
+let workerRR = 0; // Round Robin index
+
+if (typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined') {
+    try {
+        for (let i = 0; i < WORKER_COUNT; i++) {
+            workerPool.push(new Worker('./workers/compression.worker.js'));
+        }
+        console.log(`[Camera] Initialized ${workerPool.length} Compression Workers 🚀`);
+    } catch (e) {
+        console.warn('[Camera] Worker init failed:', e);
+    }
+}
 
 export async function compressImage(file) {
+    if (workerPool.length > 0) {
+        return compressImageWorker(file);
+    }
+    return compressImageFallback(file);
+}
+
+function compressImageWorker(file) {
+    return new Promise((resolve) => {
+        // Round Robin Worker Selection
+        const worker = workerPool[workerRR];
+        workerRR = (workerRR + 1) % workerPool.length;
+
+        const id = Math.random().toString(36).substr(2, 9);
+
+        const handler = (e) => {
+            if (e.data.id === id) {
+                worker.removeEventListener('message', handler);
+                if (e.data.success) {
+                    resolve(e.data.blob);
+                } else {
+                    console.warn('[Worker] Failed, falling back:', e.data.error);
+                    resolve(compressImageFallback(file));
+                }
+            }
+        };
+
+        worker.addEventListener('message', handler);
+        worker.postMessage({
+            file,
+            id,
+            maxWidth: MAX_WIDTH,
+            quality: COMPRESS_QUALITY
+        });
+    });
+}
+
+// Compresses raw gallery photos (Fallback for Main Thread)
+export async function compressImageFallback(file) {
     const img = await blobToImage(file);
 
     const sw = img.naturalWidth || img.width;
@@ -221,6 +273,7 @@ export async function compressImage(file) {
         targetH = Math.round(sh * scale);
     }
 
+    // Reuse shared canvas
     captureCanvas.width = targetW;
     captureCanvas.height = targetH;
 
@@ -244,7 +297,7 @@ export async function compressImage(file) {
                 }, 'image/jpeg', COMPRESS_QUALITY);
             } else {
                 const savings = ((1 - blob.size / file.size) * 100).toFixed(0);
-                console.log(`[Compress] ${(file.size / 1024).toFixed(0)}KB → ${(blob.size / 1024).toFixed(0)}KB (${savings}% saved)`);
+                console.log(`[Compress Main] ${(file.size / 1024).toFixed(0)}KB → ${(blob.size / 1024).toFixed(0)}KB (${savings}% saved)`);
                 resolve(blob);
             }
         }, mime, COMPRESS_QUALITY);

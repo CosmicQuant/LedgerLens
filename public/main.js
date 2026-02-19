@@ -234,8 +234,7 @@ DOM.formSetup.addEventListener('submit', async (e) => {
   }
 });
 
-const BATCH_MAX_IMAGES = 100;
-const MAX_GALLERY_UPLOAD = 20;
+const MAX_GALLERY_UPLOAD = 100;
 
 // Snap Button
 if (DOM.btnSnap) {
@@ -322,89 +321,99 @@ if ($inputBulk) {
   });
 }
 
+// Queue State
+let pendingQueue = [];
+let activeCompressions = 0;
+const MAX_CONCURRENT_COMPRESSIONS = 2; // Matches worker pool size
+
 async function handleBulkUpload(files) {
-  showToast(`Processing ${files.length} images…`, 'info');
-  let added = 0;
-  let failed = 0;
-  let errors = [];
+  showToast(`Queued ${files.length} images for processing…`, 'info');
+  pendingQueue.push(...files);
+  processQueue();
+}
 
-  for (const file of files) {
-    if (batchState.isAtLimit) {
-      showToast(`Batch limit reached (${batchState.totalCount}/${batchState.limit})`, 'warning');
-      break;
-    }
+async function processQueue() {
+  if (activeCompressions >= MAX_CONCURRENT_COMPRESSIONS || pendingQueue.length === 0) return;
 
+  // Check limit
+  if (batchState.isAtLimit) {
+    showToast('Batch limit reached', 'warning');
+    pendingQueue = [];
+    return;
+  }
+
+  const file = pendingQueue.shift();
+  activeCompressions++;
+
+  // Process (Non-blocking recursion)
+  processSingleFile(file).finally(() => {
+    activeCompressions--;
+    processQueue(); // Loop
+  });
+
+  // Try to start another if slot available
+  processQueue();
+}
+
+async function processSingleFile(file) {
+  try {
+    const receiptId = uid();
+    state.pendingCount++;
+
+    // Compress raw gallery image (Worker)
+    let compressedBlob;
     try {
-      const receiptId = uid();
-      state.pendingCount++;
-
-      // Compress raw gallery image
-      let compressedBlob;
-      try {
-        compressedBlob = await compressImage(file);
-      } catch (e) {
-        console.warn('Compression failed, using original:', e);
-        compressedBlob = file;
-      }
-
-      // Generate Thumbnail (non-fatal)
-      let thumbBlob = null;
-      try {
-        const img = await blobToImage(compressedBlob);
-        thumbBlob = await generateThumbnail(img, false);
-        URL.revokeObjectURL(img.src);
-      } catch (e) {
-        console.warn('Gallery thumbnail generation failed:', e);
-      }
-
-      // Validate Blob before IDB
-      if (!(compressedBlob instanceof Blob)) {
-        throw new Error(`Invalid blob (Type: ${typeof compressedBlob})`);
-      }
-      if (compressedBlob.size === 0) {
-        throw new Error('Empty blob');
-      }
-
-      // Save compressed blob to IDB
-      await saveReceiptToIDB({
-        id: receiptId,
-        batchId: state.batchId,
-        blob: compressedBlob,
-        thumbBlob: thumbBlob,
-        status: 'pending_upload',
-        createdAt: Date.now()
-      });
-
-      // Add to UI
-      const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(file);
-      state.activeObjectURLs.set(receiptId, displayUrl);
-      addThumbnailToQueue(receiptId, displayUrl, 'pending_upload', null, deleteReceipt);
-      added++;
-
-      // Optimistic update
-      batchState.notifyChange();
-
-      // Yield UI
-      await new Promise(r => setTimeout(r, 50));
-    } catch (err) {
-      console.error('Failed to add gallery image:', err);
-      failed++;
-      errors.push(err.message || 'Unknown error');
-      // Continue loop!
+      compressedBlob = await compressImage(file);
+    } catch (e) {
+      console.warn('Compression failed, using original:', e);
+      compressedBlob = file;
     }
-  }
 
-  if (added > 0) {
-    if (failed > 0) {
-      showToast(`Added ${added} images. Skiped ${failed} (check console).`, 'warning');
-    } else {
-      showToast(`${added} receipt(s) added`, 'success');
+    // Generate Thumbnail (Main Thread - Fast)
+    let thumbBlob = null;
+    try {
+      const img = await blobToImage(compressedBlob);
+      thumbBlob = await generateThumbnail(img, false);
+      URL.revokeObjectURL(img.src);
+    } catch (e) {
+      console.warn('Gallery thumbnail generation failed:', e);
     }
-  } else if (failed > 0) {
-    showToast(`Failed to add ${failed} images. Last error: ${errors[0]}`, 'error');
-  }
 
-  uploadPending();
+    // Validate Blob before IDB
+    if (!(compressedBlob instanceof Blob)) {
+      throw new Error(`Invalid blob (Type: ${typeof compressedBlob})`);
+    }
+
+    // Save compressed blob to IDB (Disk)
+    await saveReceiptToIDB({
+      id: receiptId,
+      batchId: state.batchId,
+      blob: compressedBlob,
+      thumbBlob: thumbBlob,
+      status: 'pending_upload',
+      createdAt: Date.now()
+    });
+
+    // Add to UI
+    const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(compressedBlob);
+    state.activeObjectURLs.set(receiptId, displayUrl);
+    addThumbnailToQueue(receiptId, displayUrl, 'pending_upload', null, deleteReceipt);
+
+    // Optimistic update
+    batchState.notifyChange();
+
+    // TRIGGER PIPELINE: Upload immediately
+    scheduleUpload(100);
+
+    // Aggressive Memory Cleanup
+    compressedBlob = undefined;
+    thumbBlob = undefined;
+    // if (typeof window.gc === 'function') window.gc(); 
+
+  } catch (err) {
+    console.error('Failed to add gallery image:', err);
+    showToast(`Error adding image: ${err.message}`, 'error');
+  }
 }
 
 // Delete Receipt
@@ -415,7 +424,13 @@ async function deleteReceipt(id) {
   const storagePath = card?._firestoreData?.storagePath;
 
   try {
-    if (storagePath) await storage.ref(storagePath).delete();
+    if (storagePath) {
+      await storage.ref(storagePath).delete();
+      // Decrement batch count (syncs with History list)
+      await db.collection('batches').doc(state.batchId).update({
+        uploadedCount: firebase.firestore.FieldValue.increment(-1)
+      });
+    }
 
     await db.collection('batches').doc(state.batchId)
       .collection('receipts').doc(id).delete();
@@ -524,10 +539,16 @@ async function ensureAuth() {
         DOM.userDisplayEmail.textContent = user.email || user.displayName;
 
         // ONLY auto-restore if explicitly #camera
-        // This prevents reloads from root or setup from jumping to camera unexpectedly
         const shouldRestore = window.location.hash === '#camera';
 
+        // UX: Show loader immediately if we expect to restore
+        if (shouldRestore && localStorage.getItem('ledgerlens_session')) {
+          showLoader('Resuming session...');
+        }
+
         const restored = shouldRestore ? await tryRestoreSession() : false;
+
+        hideLoader(); // Clear loader
 
         if (restored) {
           startExtractionListener();
