@@ -2,7 +2,7 @@ import { state } from './modules/state.js';
 import { db, auth, storage } from './modules/firebase-init.js';
 import { startCamera, stopCamera, captureFrame, generateThumbnail, blobToImage, compressImage } from './modules/camera.js';
 import { getIDB, saveReceiptToIDB, deleteReceiptFromIDB } from './modules/db.js';
-import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, updateThumbnailStatus, setBatchCompleted, updateUsageMeter } from './modules/ui.js';
+import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, updateThumbnailStatus, setBatchCompleted, updateUsageMeter, showLoader, hideLoader, showNotification } from './modules/ui.js';
 import { uploadPending, scheduleUpload } from './modules/sync.js';
 import { uid, sanitizeInput } from './modules/utils.js';
 import { batchState } from './modules/batch-state.js';
@@ -162,63 +162,76 @@ window.addEventListener('popstate', (event) => {
 });
 
 // Setup Form
+// Setup Form
+// Setup Form
 DOM.formSetup.addEventListener('submit', async (e) => {
   e.preventDefault();
 
-  const cName = sanitizeInput(DOM.inputClient.value);
-  const rawCategories = (DOM.inputCategories.value || '').trim();
+  if (DOM.btnStart) DOM.btnStart.disabled = true;
+  showLoader('Setting up batch...');
 
-  if (!cName) {
-    showToast('Please enter a company name', 'error');
-    return;
-  }
-
-  // Parse comma-separated categories into array (filter empty)
-  const customCategories = rawCategories
-    ? rawCategories.split(',').map(c => c.trim()).filter(c => c.length > 0)
-    : null;
-
-  state.setClientName(cName);
-  const newBatchId = `${cName.replace(/\s+/g, '_')}_${uid()}`;
-  state.setBatchId(newBatchId);
-  batchState.init(newBatchId, db);
-
-  saveSession();
-
-  // Clear UI
-  DOM.queueList.innerHTML = '';
-  state.pendingCount = 0;
-  batchState.reset();
-  batchState.init(newBatchId, db);
-  setBatchCompleted(false);
-
-  // Create batch in Firestore
   try {
-    const batchDoc = {
-      clientName: cName,
-      ownerId: state.currentUser.uid,
-      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-      status: 'active',
-      receiptCount: 0
-    };
-    // Only store custom categories if provided
-    if (customCategories && customCategories.length > 0) {
-      batchDoc.expenseCategories = customCategories;
+    const cName = sanitizeInput(DOM.inputClient.value);
+    const rawCategories = (DOM.inputCategories.value || '').trim();
+
+    if (!cName) {
+      showToast('Please enter a company name', 'error');
+      return;
     }
-    await db.collection('batches').doc(newBatchId).set(batchDoc);
+
+    // Parse comma-separated categories into array (filter empty)
+    const customCategories = rawCategories
+      ? rawCategories.split(',').map(c => c.trim()).filter(c => c.length > 0)
+      : null;
+
+    state.setClientName(cName);
+    const newBatchId = `${cName.replace(/\s+/g, '_')}_${uid()}`;
+    state.setBatchId(newBatchId);
+    batchState.init(newBatchId, db);
+
+    saveSession();
+
+    // Clear UI
+    DOM.queueList.innerHTML = '';
+    state.pendingCount = 0;
+    batchState.reset();
+    batchState.init(newBatchId, db);
+    setBatchCompleted(false);
+
+    // Create batch in Firestore
+    try {
+      const batchDoc = {
+        clientName: cName,
+        ownerId: state.currentUser.uid,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        status: 'active',
+        receiptCount: 0
+      };
+      // Only store custom categories if provided
+      if (customCategories && customCategories.length > 0) {
+        batchDoc.expenseCategories = customCategories;
+      }
+      await db.collection('batches').doc(newBatchId).set(batchDoc);
+    } catch (err) {
+      console.warn('Firestore batch create deferred (offline):', err);
+    }
+
+    DOM.lblClient.textContent = cName;
+    DOM.lblBatch.textContent = `Batch ${newBatchId.slice(0, 8)}…`;
+
+    // Push history state so back button works
+    history.pushState({ screen: 'camera' }, 'Camera', '#camera');
+
+    showScreen(DOM.camera);
+    await startCamera(DOM.video, DOM.btnTorch);
+    showToast(`Batch started for ${cName}`, 'success');
   } catch (err) {
-    console.warn('Firestore batch create deferred (offline):', err);
+    showToast(`Setup failed: ${err.message}`, 'error');
+    console.error(err);
+  } finally {
+    hideLoader();
+    if (DOM.btnStart) DOM.btnStart.disabled = false;
   }
-
-  DOM.lblClient.textContent = cName;
-  DOM.lblBatch.textContent = `Batch ${newBatchId.slice(0, 8)}…`;
-
-  // Push history state so back button works
-  history.pushState({ screen: 'camera' }, 'Camera', '#camera');
-
-  showScreen(DOM.camera);
-  await startCamera(DOM.video, DOM.btnTorch);
-  showToast(`Batch started for ${cName}`, 'success');
 });
 
 const BATCH_MAX_IMAGES = 100;
@@ -277,6 +290,9 @@ const $inputBulk = document.getElementById('input-bulk');
 
 if ($btnGallery) {
   $btnGallery.addEventListener('click', () => {
+    showToast('Opening Gallery...', 'info');
+    $btnGallery.disabled = true;
+    setTimeout(() => $btnGallery.disabled = false, 3000);
     $inputBulk.click();
   });
 }
@@ -309,16 +325,20 @@ if ($inputBulk) {
 async function handleBulkUpload(files) {
   showToast(`Processing ${files.length} images…`, 'info');
   let added = 0;
+  let failed = 0;
+  let errors = [];
 
   for (const file of files) {
-    if (batchState.isAtLimit) break;
+    if (batchState.isAtLimit) {
+      showToast(`Batch limit reached (${batchState.totalCount}/${batchState.limit})`, 'warning');
+      break;
+    }
 
     try {
       const receiptId = uid();
       state.pendingCount++;
 
-      // Compress raw gallery image (e.g. 12MP iPhone → 1500px)
-      // Same quality as camera captures — critical for iPhone/Safari
+      // Compress raw gallery image
       let compressedBlob;
       try {
         compressedBlob = await compressImage(file);
@@ -337,7 +357,15 @@ async function handleBulkUpload(files) {
         console.warn('Gallery thumbnail generation failed:', e);
       }
 
-      // Save compressed blob to IDB (not raw file)
+      // Validate Blob before IDB
+      if (!(compressedBlob instanceof Blob)) {
+        throw new Error(`Invalid blob (Type: ${typeof compressedBlob})`);
+      }
+      if (compressedBlob.size === 0) {
+        throw new Error('Empty blob');
+      }
+
+      // Save compressed blob to IDB
       await saveReceiptToIDB({
         id: receiptId,
         batchId: state.batchId,
@@ -347,30 +375,35 @@ async function handleBulkUpload(files) {
         createdAt: Date.now()
       });
 
-      // Add to UI (prefer thumbBlob for queue)
+      // Add to UI
       const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(file);
       state.activeObjectURLs.set(receiptId, displayUrl);
       addThumbnailToQueue(receiptId, displayUrl, 'pending_upload', null, deleteReceipt);
       added++;
 
-      // Optimistic update per file
+      // Optimistic update
       batchState.notifyChange();
 
-      // Yield to UI thread every file to prevent freeze
+      // Yield UI
       await new Promise(r => setTimeout(r, 50));
     } catch (err) {
       console.error('Failed to add gallery image:', err);
-      showToast(`Failed to add image: ${err.message}`, 'error');
+      failed++;
+      errors.push(err.message || 'Unknown error');
+      // Continue loop!
     }
   }
 
-  if (batchState.isAtLimit) {
-    showToast(`Batch limit reached (${batchState.totalCount}/${batchState.limit})`, 'warning');
+  if (added > 0) {
+    if (failed > 0) {
+      showToast(`Added ${added} images. Skiped ${failed} (check console).`, 'warning');
+    } else {
+      showToast(`${added} receipt(s) added`, 'success');
+    }
+  } else if (failed > 0) {
+    showToast(`Failed to add ${failed} images. Last error: ${errors[0]}`, 'error');
   }
 
-  if (added > 0) {
-    showToast(`${added} receipt(s) added`, 'success');
-  }
   uploadPending();
 }
 
@@ -617,6 +650,7 @@ async function showHistory() {
             `;
       item.querySelector('.btn-restore').onclick = () => {
         if (!confirm('Restore this batch?')) return;
+        showLoader('Restoring session...');
         state.setClientName(b.clientName);
         state.setBatchId(doc.id);
         saveSession(b.status || 'active');

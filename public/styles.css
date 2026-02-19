@@ -1607,6 +1607,48 @@ body {
   box-sizing: border-box;
 }
 
+/* Full screen loader */
+.loader-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s;
+}
+
+.loader-overlay.active {
+  opacity: 1;
+  pointer-events: all;
+  /* Ensure it blocks clicks */
+}
+
+.loader-spinner {
+  width: 48px;
+  height: 48px;
+  border: 5px solid rgba(255, 255, 255, 0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.loader-text {
+  color: white;
+  margin-top: 16px;
+  font-weight: 500;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 #input-categories:focus {
   outline: none;
   border-color: var(--accent);

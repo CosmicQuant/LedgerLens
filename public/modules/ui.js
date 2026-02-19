@@ -37,7 +37,19 @@ export const DOM = {
     userDisplayEmail: document.getElementById('user-display-email'),
     btnLogout: document.getElementById('btn-logout'),
     btnGoogleLogin: document.getElementById('btn-google-login'),
+    loader: document.getElementById('global-loader'),
+    loaderText: document.getElementById('global-loader-text'),
 };
+
+export function showLoader(msg = 'Loading...') {
+    if (DOM.loader) {
+        DOM.loaderText.textContent = msg;
+        DOM.loader.classList.add('active');
+    }
+}
+export function hideLoader() {
+    if (DOM.loader) DOM.loader.classList.remove('active');
+}
 
 // Wire up global modal close (Safety for user report: modal not closing)
 if (DOM.modalClose) {
