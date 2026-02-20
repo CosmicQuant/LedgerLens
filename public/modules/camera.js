@@ -121,25 +121,30 @@ export function stopCamera(videoElement) {
 }
 
 // ── Frame Capture ────────────────────────────────────────
-// A++ Architecture: Offloads encoding to worker via ImageBitmap transfer
+// Pure Shutter: Captures raw pixels, hands over to Pipeline.
 export async function captureFrame(videoElement) {
-    if (!state.mediaStream) {
-        console.error("No media stream available for capture");
-        return null;
-    }
+    if (!state.mediaStream) return null;
 
     try {
-        // 1. Create Bitmap on the main thread (fastest way to "pause" the frame)
-        // This is effectively our "shutter"
+        // Shutter: Capture instantaneous bitmap
         const bitmap = await createImageBitmap(videoElement);
 
-        // 2. Hand off to worker for compression
-        // This keeps the UI thread 100% free while the JPEG is generated
-        return await compressImageWorker(bitmap);
+        // Convert to blob so it can be handled by the Pipeline logic (Gatekeeper + Slicing)
+        // We use a helper canvas for this conversion
+        captureCanvas.width = videoElement.videoWidth;
+        captureCanvas.height = videoElement.videoHeight;
+        captureCtx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+
+        return new Promise(resolve => {
+            captureCanvas.toBlob(blob => {
+                if (blob) blob.name = `capture_${Date.now()}.jpg`;
+                resolve(blob);
+            }, 'image/jpeg', 0.95); // High quality for raw capture
+        });
     } catch (err) {
-        console.error("[Capture] A++ worker failure:", err);
-        showToast('Camera capture failed (Worker Busy)', 'error');
-        throw err;
+        console.error("[Camera] Shutter failed:", err);
+        return null;
     }
 }
 
@@ -203,145 +208,7 @@ export async function generateThumbnail(source, isVideo = true) {
     });
 }
 
-// ── Gallery Image Compression ────────────────────────────
-
-/* Worker Pool by LedgerLens - 2 Parallel Workers */
-const WORKER_COUNT = 2;
-const workerPool = [];
-let workerRR = 0; // Round Robin index
-
-function createWorker(index) {
-    const w = new Worker('./workers/compression.worker.js');
-    console.log(`[Camera] Worker ${index} Spawned 🚀`);
-    return w;
-}
-
-if (typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined') {
-    try {
-        for (let i = 0; i < WORKER_COUNT; i++) {
-            workerPool.push(createWorker(i));
-        }
-    } catch (e) {
-        console.warn('[Camera] Worker init failed:', e);
-    }
-}
-
-function respawnWorker(index) {
-    if (workerPool[index]) {
-        workerPool[index].terminate(); // Double safe
-    }
-    workerPool[index] = createWorker(index);
-}
-
-export async function compressImage(file) {
-    if (workerPool.length > 0) {
-        // A++ Path: Use ImageBitmap for zero-copy if possible
-        try {
-            const bitmap = await createImageBitmap(file);
-            return await compressImageWorker(bitmap);
-        } catch (e) {
-            console.warn('[Camera] Bitmap creation failed, sending raw blob:', e);
-            return compressImageWorker(file);
-        }
-    }
-    return compressImageFallback(file);
-}
-
-function compressImageWorker(data) {
-    return new Promise((resolve, reject) => {
-        // Round Robin Worker Selection
-        const currentIdx = workerRR;
-        const worker = workerPool[currentIdx];
-        workerRR = (workerRR + 1) % workerPool.length;
-
-        const id = Math.random().toString(36).substr(2, 9);
-
-        // A++ Kill & Respawn Timeout (30s)
-        const timeout = setTimeout(() => {
-            worker.removeEventListener('message', handler);
-            console.error(`[A++ Guard] Worker ${currentIdx} HUNG on ${id}. TERMINATING! 🛡️`);
-
-            // 1. Kill the zombie worker
-            worker.terminate();
-
-            // 2. Respawn a clean slate
-            respawnWorker(currentIdx);
-
-            // 3. Quarantine the task (reject)
-            reject(new Error(`Worker Timeout (${id})`));
-        }, 30000);
-
-        const handler = (e) => {
-            if (e.data.id === id) {
-                clearTimeout(timeout);
-                worker.removeEventListener('message', handler);
-                if (e.data.success) {
-                    console.log(`[Worker] ${id} success (${Math.round(e.data.blob.size / 1024)} KB)`);
-                    resolve(e.data.blob);
-                } else {
-                    console.error(`[Worker] ${id} Failed:`, e.data.error);
-                    reject(new Error(e.data.error));
-                }
-            }
-        };
-
-        const transfer = (data instanceof ImageBitmap) ? [data] : [];
-        worker.addEventListener('message', handler);
-        worker.postMessage({
-            file: data,
-            id,
-            maxWidth: MAX_WIDTH,
-            quality: COMPRESS_QUALITY
-        }, transfer);
-    });
-}
-
-// Compresses raw gallery photos (Fallback for Main Thread)
-export async function compressImageFallback(file) {
-    const img = await blobToImage(file);
-
-    const sw = img.naturalWidth || img.width;
-    const sh = img.naturalHeight || img.height;
-
-    // Only downscale if wider than MAX_WIDTH
-    let targetW = sw;
-    let targetH = sh;
-    if (sw > MAX_WIDTH) {
-        const scale = MAX_WIDTH / sw;
-        targetW = MAX_WIDTH;
-        targetH = Math.round(sh * scale);
-    }
-
-    // Reuse shared canvas
-    captureCanvas.width = targetW;
-    captureCanvas.height = targetH;
-
-    try {
-        captureCtx.drawImage(img, 0, 0, targetW, targetH);
-    } catch (err) {
-        console.error('[Compress] Canvas draw error:', err);
-        URL.revokeObjectURL(img.src);
-        return file; // Return original on failure
-    }
-
-    URL.revokeObjectURL(img.src);
-
-    const mime = getPreferredMime();
-    return new Promise(resolve => {
-        captureCanvas.toBlob(blob => {
-            if (!blob || blob.size === 0) {
-                // Fallback to JPEG
-                captureCanvas.toBlob(fb => {
-                    resolve(fb || file);
-                }, 'image/jpeg', COMPRESS_QUALITY);
-            } else {
-                const savings = ((1 - blob.size / file.size) * 100).toFixed(0);
-                console.log(`[Compress Main] ${(file.size / 1024).toFixed(0)}KB → ${(blob.size / 1024).toFixed(0)}KB (${savings}% saved)`);
-                resolve(blob);
-            }
-        }, mime, COMPRESS_QUALITY);
-    });
-}
+// Note: Worker Pool and Compression logic moved to uploader.js
 
 // ── Helpers ──────────────────────────────────────────────
 

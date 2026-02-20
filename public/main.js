@@ -1,9 +1,9 @@
 import { state } from './modules/state.js';
 import { db, auth, storage } from './modules/firebase-init.js';
-import { startCamera, stopCamera, captureFrame, generateThumbnail, blobToImage, compressImage } from './modules/camera.js';
+import { startCamera, stopCamera, captureFrame } from './modules/camera.js';
 import { getIDB, saveReceiptToIDB, deleteReceiptFromIDB } from './modules/db.js';
 import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, updateThumbnailStatus, setBatchCompleted, updateUsageMeter, showLoader, hideLoader, showNotification } from './modules/ui.js';
-import { uploadPending, scheduleUpload } from './modules/sync.js';
+import { uploader } from './modules/uploader.js';
 import { uid, sanitizeInput } from './modules/utils.js';
 import { batchState } from './modules/batch-state.js';
 import { startWatchdog, stopWatchdog } from './modules/watchdog.js';
@@ -100,6 +100,7 @@ async function tryRestoreSession() {
     // Use BatchStateManager for authoritative count
     await batchState.recalculate();
 
+    console.log(`[Restore] Displaying ${all.length} items. UI Screen: Camera.`);
     showScreen(DOM.camera);
     setBatchCompleted(sess.status === 'completed');
 
@@ -110,12 +111,11 @@ async function tryRestoreSession() {
     try {
       await startCamera(DOM.video, DOM.btnTorch);
     } catch (camErr) {
-      console.error('Camera failed during restore:', camErr);
+      console.error('[Restore] Camera failed:', camErr);
       showToast('Camera access failed, but batch restored.', 'error');
     }
 
-    uploadPending();
-    setTimeout(() => checkAndTriggerRetries(), 2000);
+    uploader.processNetworkQueue();
     return true;
   } catch (e) {
     console.warn('Session restore failed:', e);
@@ -154,11 +154,14 @@ function resetApp(isPopState = false) {
 
 // Handle Android Back Button (History API)
 window.addEventListener('popstate', (event) => {
-  // If the user was on the camera screen and hit the browser's back button
+  console.log('[History] Popstate:', window.location.hash);
+  // If user hits 'back' from camera screen
   if (DOM.camera.classList.contains('active') && window.location.hash !== '#camera') {
-    resetApp(true);
+    // Only reset if they are actually moving AWAY from camera
+    if (window.location.hash === '' || window.location.hash === '#setup') {
+      resetApp(true);
+    }
   } else if (window.location.hash === '#camera' && !DOM.camera.classList.contains('active')) {
-    // If they navigated FORWARD to #camera (unlikely via browser native UI but possible)
     tryRestoreSession();
   }
 });
@@ -251,48 +254,17 @@ if (DOM.btnSnap) {
       return;
     }
 
-    // 1. Capture Full Image
-    let fullBlob;
-    const receiptId = uid();
-
     try {
-      fullBlob = await captureFrame(DOM.video);
-      if (!fullBlob) throw new Error('Capture returned null');
+      const fullBlob = await captureFrame(DOM.video);
+      if (!fullBlob) throw new Error('Capture failed');
+
+      // Hand over to the Unified Pipeline
+      uploader.handleFiles([fullBlob]);
     } catch (err) {
       console.error("[Shutter] A++ Capture Failure:", err);
       // Inline Error Report: Add to UI even on failure
-      addThumbnailToQueue(receiptId, './img/failed-capture.png', 'quarantined', null, deleteReceipt);
-      return;
+      addThumbnailToQueue(uid(), './img/failed-capture.png', 'quarantined', null, deleteReceipt);
     }
-
-    state.pendingCount++;
-
-    // 2. Capture/Generate Thumbnail (non-fatal)
-    let thumbBlob = null;
-    try {
-      thumbBlob = await generateThumbnail(DOM.video, true);
-    } catch (e) {
-      console.warn('Thumbnail generation failed, using full blob:', e);
-    }
-
-    // Save to IDB
-    await saveReceiptToIDB({
-      id: receiptId,
-      batchId: state.batchId,
-      blob: fullBlob,
-      thumbBlob: thumbBlob,
-      status: 'pending_upload',
-      createdAt: Date.now()
-    });
-
-    // Add to UI
-    const thumbUrl = URL.createObjectURL(thumbBlob || fullBlob);
-    state.activeObjectURLs.set(receiptId, thumbUrl);
-    addThumbnailToQueue(receiptId, thumbUrl, 'pending_upload', null, deleteReceipt);
-
-    // Notify BatchStateManager (optimistic + async recount)
-    batchState.notifyChange();
-    uploadPending();
   };
 }
 
@@ -314,166 +286,33 @@ if ($inputBulk) {
     const files = Array.from(e.target.files);
     if (!files.length) return;
 
-    // Per-selection limit
     if (files.length > MAX_GALLERY_UPLOAD) {
-      showToast(`Please select up to ${MAX_GALLERY_UPLOAD} images at a time.`, 'error');
+      showToast('Max 100 images per selection', 'warning');
       $inputBulk.value = '';
       return;
     }
 
-    // Batch limit check
-    const remaining = batchState.remaining;
-    if (files.length > remaining) {
-      showToast(`Cannot add ${files.length} images. Only ${remaining} slots remaining.`, 'error');
+    if (files.length > batchState.remaining) {
+      showToast(`Batch limit reached. Only ${batchState.remaining} slots left.`, 'error');
       $inputBulk.value = '';
       return;
     }
 
     $inputBulk.value = '';
-    handleBulkUpload(files);
+    uploader.handleFiles(files);
   });
 }
 
 // Queue State
-let pendingQueue = [];
-let activeCompressions = 0;
-let totalQueued = 0;
-let totalProcessed = 0;
-let totalFailed = 0;
 
-// Adaptive Concurrency: 1 on mobile (RAM limited), 2 on desktop
-const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-const MAX_CONCURRENT_COMPRESSIONS = isMobile ? 1 : 2;
 
-async function handleBulkUpload(files) {
-  showToast(`Processing ${files.length} images…`, 'info');
-  totalQueued = files.length;
-  totalProcessed = 0;
-  totalFailed = 0;
-  pendingQueue.push(...files);
-  processQueue();
-}
 
-function processQueue() {
-  console.log(`[Queue] Status: ${activeCompressions}/${MAX_CONCURRENT_COMPRESSIONS} active, ${pendingQueue.length} pending.`);
 
-  while (activeCompressions < MAX_CONCURRENT_COMPRESSIONS && pendingQueue.length > 0) {
-    if (batchState.isAtLimit) {
-      showToast('Batch limit reached', 'warning');
-      pendingQueue = [];
-      return;
-    }
 
-    const file = pendingQueue.shift();
-    activeCompressions++;
 
-    // Safety Hatch: If a job takes > 40s (longer than worker timeout), it's likely permanently hung.
-    // We increment a "generation counter" to track if the queue is moving.
-    const currentGeneration = ++queueGeneration;
-    setTimeout(() => {
-      if (currentGeneration === queueGeneration && activeCompressions > 0 && pendingQueue.length > 0) {
-        console.warn('[Queue] Safety hatch triggered after 40s stall. Resetting slots.');
-        activeCompressions = 0;
-        processQueue();
-      }
-    }, 40000);
 
-    console.log(`[Queue] Processing: ${file.name} (${Math.round(file.size / 1024)} KB)`);
 
-    processSingleFile(file).finally(() => {
-      activeCompressions--;
-      queueGeneration++; // Signal progress
 
-      // Brief yield for GC before next file (critical on mobile)
-      setTimeout(() => processQueue(), 50);
-    });
-  }
-
-  // Show summary when queue drains
-  if (pendingQueue.length === 0 && activeCompressions === 0 && totalQueued > 0) {
-    console.log(`[Queue] Finished batch: ${totalProcessed} added, ${totalFailed} failed.`);
-    if (totalFailed > 0) {
-      showToast(`${totalProcessed} images added successfully. ${totalFailed} failed to process.`, 'warning');
-    } else if (totalProcessed > 0) {
-      showToast(`${totalProcessed} receipt(s) added ✓`, 'success');
-    }
-    totalQueued = 0;
-
-    // Final upload push
-    uploadPending();
-  }
-}
-
-let queueGeneration = 0;
-
-async function processSingleFile(file) {
-  try {
-    const receiptId = uid();
-    state.pendingCount++;
-
-    // Compress raw gallery image (Worker - A++ Resilience)
-    let compressedBlob;
-    try {
-      compressedBlob = await compressImage(file);
-    } catch (e) {
-      console.error(`[Quarantine] ${file.name} failed A++ processing:`, e);
-      totalFailed++;
-      state.pendingCount--;
-
-      // Inline Error Report: Show the card but mark it as quarantined
-      addThumbnailToQueue(receiptId, URL.createObjectURL(file), 'quarantined', null, deleteReceipt);
-      return;
-    }
-
-    // Generate Thumbnail (Main Thread - Fast)
-    let thumbBlob = null;
-    try {
-      const img = await blobToImage(compressedBlob);
-      thumbBlob = await generateThumbnail(img, false);
-      URL.revokeObjectURL(img.src);
-    } catch (e) {
-      console.warn('Gallery thumbnail generation failed:', e);
-    }
-
-    // Validate Blob before IDB
-    if (!(compressedBlob instanceof Blob)) {
-      throw new Error(`Invalid blob (Type: ${typeof compressedBlob})`);
-    }
-    if (compressedBlob.size === 0) {
-      throw new Error('Empty blob after compression');
-    }
-
-    // Save compressed blob to IDB (Disk)
-    await saveReceiptToIDB({
-      id: receiptId,
-      batchId: state.batchId,
-      blob: compressedBlob,
-      thumbBlob: thumbBlob,
-      status: 'pending_upload',
-      createdAt: Date.now()
-    });
-
-    // Add to UI
-    const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(compressedBlob);
-    state.activeObjectURLs.set(receiptId, displayUrl);
-    addThumbnailToQueue(receiptId, displayUrl, 'pending_upload', null, deleteReceipt);
-    totalProcessed++;
-
-    // Optimistic update
-    batchState.notifyChange();
-
-    // TRIGGER PIPELINE: Upload immediately
-    scheduleUpload(500);
-
-    // Aggressive Memory Cleanup
-    compressedBlob = null;
-    thumbBlob = null;
-
-  } catch (err) {
-    console.error('Failed to add gallery image:', err);
-    totalFailed++;
-  }
-}
 
 // Delete Receipt
 async function deleteReceipt(id) {

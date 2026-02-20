@@ -162,8 +162,28 @@ export function updateFinishButton(totalCount, pendingCount) {
  * Update the usage meter display and color zone.
  * Called by BatchStateManager subscriber.
  */
-export function updateUsageMeter({ totalCount, limit, zone, isAtLimit }) {
-    if (DOM.snapCount) DOM.snapCount.textContent = totalCount;
+export function updateUsageMeter({ totalCount, syncedCount, pendingCount, limit, zone, isAtLimit }) {
+    if (DOM.snapCount) {
+        // Professional status line: "Synced / Total"
+        DOM.snapCount.textContent = `${syncedCount || 0} / ${totalCount || 0}`;
+
+        // Add a secondary status label if it doesn't exist
+        let subStatus = document.getElementById('usage-sub-status');
+        if (!subStatus && DOM.snapCount.parentElement) {
+            subStatus = document.createElement('div');
+            subStatus.id = 'usage-sub-status';
+            subStatus.className = 'snap-sub-status'; // Use a class for potential styling
+            subStatus.style.fontSize = '12px';
+            subStatus.style.opacity = '0.7';
+            subStatus.style.marginTop = '4px';
+            DOM.snapCount.parentElement.appendChild(subStatus);
+        }
+        if (subStatus) {
+            subStatus.textContent = (pendingCount > 0)
+                ? `${pendingCount} uploading...`
+                : (totalCount > 0 ? 'All synced ✓' : 'Ready to snap');
+        }
+    }
 
     if (DOM.usageMeter) {
         DOM.usageMeter.classList.remove('zone-normal', 'zone-warning', 'zone-limit');
