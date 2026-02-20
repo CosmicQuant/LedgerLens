@@ -31,12 +31,10 @@ export const DOM = {
     btnTorch: document.getElementById('btn-torch'),
     btnTheme: document.getElementById('btn-theme-toggle'),
     btnResetSession: document.getElementById('btn-reset-session'),
-    btnStressTest: document.getElementById('btn-stress-test'),
-    btnStressCleanup: document.getElementById('btn-stress-cleanup'),
-    userProfile: document.getElementById('user-profile'),
-    userDisplayEmail: document.getElementById('user-display-email'),
     btnLogout: document.getElementById('btn-logout'),
     btnGoogleLogin: document.getElementById('btn-google-login'),
+    userProfile: document.getElementById('user-profile'),
+    userDisplayEmail: document.getElementById('user-display-email'),
     loader: document.getElementById('global-loader'),
     loaderText: document.getElementById('global-loader-text'),
 };
@@ -214,8 +212,18 @@ export function addThumbnailToQueue(id, thumbUrl, status, firestoreData, onDelet
 
     // Thumbnail
     const img = document.createElement('img');
-    img.src = thumbUrl;
+    const isPlaceholder = !thumbUrl || thumbUrl.includes('failed-capture');
+    img.src = isPlaceholder ? 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7' : thumbUrl;
+    if (isPlaceholder) div.classList.add('is-placeholder');
     inner.appendChild(img);
+
+    // Add Placeholder Icon if needed
+    if (isPlaceholder) {
+        const iconFail = document.createElement('span');
+        iconFail.className = 'material-symbols-rounded placeholder-icon';
+        iconFail.textContent = 'unpaved_road'; // Or 'image_not_supported'
+        inner.appendChild(iconFail);
+    }
 
     // Progress Bar
     const prog = document.createElement('div');
@@ -250,6 +258,12 @@ export function addThumbnailToQueue(id, thumbUrl, status, firestoreData, onDelet
     badgeDup.textContent = 'Duplicate';
     inner.appendChild(badgeDup);
 
+    // Quarantined Badge
+    const badgeQuarantine = document.createElement('div');
+    badgeQuarantine.className = 'badge-quarantine';
+    badgeQuarantine.textContent = '⚠️ Unreadable';
+    inner.appendChild(badgeQuarantine);
+
     // Force remove processing if extracted/invalid/error
     updateThumbnailStatus(id, status, firestoreData);
 
@@ -278,7 +292,7 @@ export function updateThumbnailStatus(id, status, firestoreData, uploadProgress)
     const card = document.getElementById(`q-${id}`);
     if (!card) return;
 
-    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload', 'is-processing', 'is-invalid', 'pending_retry');
+    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload', 'is-processing', 'is-invalid', 'pending_retry', 'quarantined');
     card.classList.add(status);
 
     if (firestoreData) card._firestoreData = firestoreData;

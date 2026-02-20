@@ -252,13 +252,19 @@ if (DOM.btnSnap) {
     }
 
     // 1. Capture Full Image
-    const fullBlob = await captureFrame(DOM.video);
-    if (!fullBlob) {
-      showToast('Capture failed — please try again', 'error');
+    let fullBlob;
+    const receiptId = uid();
+
+    try {
+      fullBlob = await captureFrame(DOM.video);
+      if (!fullBlob) throw new Error('Capture returned null');
+    } catch (err) {
+      console.error("[Shutter] A++ Capture Failure:", err);
+      // Inline Error Report: Add to UI even on failure
+      addThumbnailToQueue(receiptId, './img/failed-capture.png', 'quarantined', null, deleteReceipt);
       return;
     }
 
-    const receiptId = uid();
     state.pendingCount++;
 
     // 2. Capture/Generate Thumbnail (non-fatal)
@@ -331,49 +337,92 @@ if ($inputBulk) {
 // Queue State
 let pendingQueue = [];
 let activeCompressions = 0;
-const MAX_CONCURRENT_COMPRESSIONS = 2; // Matches worker pool size
+let totalQueued = 0;
+let totalProcessed = 0;
+let totalFailed = 0;
+
+// Adaptive Concurrency: 1 on mobile (RAM limited), 2 on desktop
+const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+const MAX_CONCURRENT_COMPRESSIONS = isMobile ? 1 : 2;
 
 async function handleBulkUpload(files) {
-  showToast(`Queued ${files.length} images for processing…`, 'info');
+  showToast(`Processing ${files.length} images…`, 'info');
+  totalQueued = files.length;
+  totalProcessed = 0;
+  totalFailed = 0;
   pendingQueue.push(...files);
   processQueue();
 }
 
-async function processQueue() {
-  if (activeCompressions >= MAX_CONCURRENT_COMPRESSIONS || pendingQueue.length === 0) return;
+function processQueue() {
+  console.log(`[Queue] Status: ${activeCompressions}/${MAX_CONCURRENT_COMPRESSIONS} active, ${pendingQueue.length} pending.`);
 
-  // Check limit
-  if (batchState.isAtLimit) {
-    showToast('Batch limit reached', 'warning');
-    pendingQueue = [];
-    return;
+  while (activeCompressions < MAX_CONCURRENT_COMPRESSIONS && pendingQueue.length > 0) {
+    if (batchState.isAtLimit) {
+      showToast('Batch limit reached', 'warning');
+      pendingQueue = [];
+      return;
+    }
+
+    const file = pendingQueue.shift();
+    activeCompressions++;
+
+    // Safety Hatch: If a job takes > 40s (longer than worker timeout), it's likely permanently hung.
+    // We increment a "generation counter" to track if the queue is moving.
+    const currentGeneration = ++queueGeneration;
+    setTimeout(() => {
+      if (currentGeneration === queueGeneration && activeCompressions > 0 && pendingQueue.length > 0) {
+        console.warn('[Queue] Safety hatch triggered after 40s stall. Resetting slots.');
+        activeCompressions = 0;
+        processQueue();
+      }
+    }, 40000);
+
+    console.log(`[Queue] Processing: ${file.name} (${Math.round(file.size / 1024)} KB)`);
+
+    processSingleFile(file).finally(() => {
+      activeCompressions--;
+      queueGeneration++; // Signal progress
+
+      // Brief yield for GC before next file (critical on mobile)
+      setTimeout(() => processQueue(), 50);
+    });
   }
 
-  const file = pendingQueue.shift();
-  activeCompressions++;
+  // Show summary when queue drains
+  if (pendingQueue.length === 0 && activeCompressions === 0 && totalQueued > 0) {
+    console.log(`[Queue] Finished batch: ${totalProcessed} added, ${totalFailed} failed.`);
+    if (totalFailed > 0) {
+      showToast(`${totalProcessed} images added successfully. ${totalFailed} failed to process.`, 'warning');
+    } else if (totalProcessed > 0) {
+      showToast(`${totalProcessed} receipt(s) added ✓`, 'success');
+    }
+    totalQueued = 0;
 
-  // Process (Non-blocking recursion)
-  processSingleFile(file).finally(() => {
-    activeCompressions--;
-    processQueue(); // Loop
-  });
-
-  // Try to start another if slot available
-  processQueue();
+    // Final upload push
+    uploadPending();
+  }
 }
+
+let queueGeneration = 0;
 
 async function processSingleFile(file) {
   try {
     const receiptId = uid();
     state.pendingCount++;
 
-    // Compress raw gallery image (Worker)
+    // Compress raw gallery image (Worker - A++ Resilience)
     let compressedBlob;
     try {
       compressedBlob = await compressImage(file);
     } catch (e) {
-      console.warn('Compression failed, using original:', e);
-      compressedBlob = file;
+      console.error(`[Quarantine] ${file.name} failed A++ processing:`, e);
+      totalFailed++;
+      state.pendingCount--;
+
+      // Inline Error Report: Show the card but mark it as quarantined
+      addThumbnailToQueue(receiptId, URL.createObjectURL(file), 'quarantined', null, deleteReceipt);
+      return;
     }
 
     // Generate Thumbnail (Main Thread - Fast)
@@ -390,6 +439,9 @@ async function processSingleFile(file) {
     if (!(compressedBlob instanceof Blob)) {
       throw new Error(`Invalid blob (Type: ${typeof compressedBlob})`);
     }
+    if (compressedBlob.size === 0) {
+      throw new Error('Empty blob after compression');
+    }
 
     // Save compressed blob to IDB (Disk)
     await saveReceiptToIDB({
@@ -405,21 +457,21 @@ async function processSingleFile(file) {
     const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(compressedBlob);
     state.activeObjectURLs.set(receiptId, displayUrl);
     addThumbnailToQueue(receiptId, displayUrl, 'pending_upload', null, deleteReceipt);
+    totalProcessed++;
 
     // Optimistic update
     batchState.notifyChange();
 
     // TRIGGER PIPELINE: Upload immediately
-    scheduleUpload(100);
+    scheduleUpload(500);
 
     // Aggressive Memory Cleanup
-    compressedBlob = undefined;
-    thumbBlob = undefined;
-    // if (typeof window.gc === 'function') window.gc(); 
+    compressedBlob = null;
+    thumbBlob = null;
 
   } catch (err) {
     console.error('Failed to add gallery image:', err);
-    showToast(`Error adding image: ${err.message}`, 'error');
+    totalFailed++;
   }
 }
 

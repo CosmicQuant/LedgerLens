@@ -2,13 +2,13 @@
  * watchdog.js — Safety Net for Stalled Extractions
  * 
  * Monitors the batch for "stragglers" — receipts that uploaded successfully ('synced')
- * but haven't been extracted ('extracted') within a reasonable time (e.g., 45s).
+ * but haven't been extracted within a reasonable time (45s).
  * This handles Cloud Function cold starts, timeouts, or transient gRPC errors.
  * 
  * Strategy:
- * 1. Poll every 10s.
+ * 1. Poll every 15s (not too aggressive on mobile battery).
  * 2. Find items in 'synced' state for > 45s.
- * 3. Flip status to 'pending_retry' (Triggering Cloud Function).
+ * 3. Flip status to 'pending_retry' → triggers Cloud Function.
  * 4. Cap retries to 3 per item.
  */
 
@@ -16,7 +16,7 @@ import { db } from './firebase-init.js';
 import { state } from './state.js';
 import { showToast } from './ui.js';
 
-const CHECK_INTERVAL_MS = 10000; // Check every 10s
+const CHECK_INTERVAL_MS = 15000; // Check every 15s
 const STALL_THRESHOLD_MS = 45000; // 45s timeout for extraction
 const MAX_RETRIES = 3;
 
@@ -29,8 +29,10 @@ export function startWatchdog() {
 }
 
 export function stopWatchdog() {
-    if (watchdogTimer) clearInterval(watchdogTimer);
-    watchdogTimer = null;
+    if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+    }
 }
 
 async function checkStragglers() {
@@ -40,15 +42,9 @@ async function checkStragglers() {
         const now = Date.now();
         const batchRef = db.collection('batches').doc(state.batchId).collection('receipts');
 
-        // Query for items that might be stuck
-        // Note: We scan all 'synced' items in memory or query specific ones.
-        // For efficiency, we can just query 'synced' from Firestore if the list is huge,
-        // but since we have a listener in main.js, we *could* check local state?
-        // Actually, let's query Firestore to be the source of truth.
-
+        // Query ONLY by status (ownerId lives on the batch parent, not on receipts)
         const snapshot = await batchRef
             .where('status', '==', 'synced')
-            .where('ownerId', '==', state.currentUser.uid)
             .get();
 
         if (snapshot.empty) return;
@@ -57,7 +53,7 @@ async function checkStragglers() {
 
         snapshot.forEach(doc => {
             const data = doc.data();
-            const uploadedAt = data.uploadedAt?.toMillis() || 0;
+            const uploadedAt = data.uploadedAt?.toMillis?.() || 0;
             const retryCount = data.retryCount || 0;
 
             // If it's been 'synced' for > 45s and not yet extracted
@@ -68,7 +64,7 @@ async function checkStragglers() {
                         doc.ref.update({
                             status: 'pending_retry',
                             retryCount: retryCount + 1,
-                            lastRetryAt: firebase.firestore.FieldValue.serverTimestamp()
+                            lastRetryAt: new Date().toISOString()
                         })
                     );
                 } else {
@@ -89,6 +85,7 @@ async function checkStragglers() {
         }
 
     } catch (err) {
-        console.error('[Watchdog] Check failed:', err);
+        // Silently ignore — watchdog is non-critical, must never crash the app
+        console.warn('[Watchdog] Check failed:', err.message);
     }
 }

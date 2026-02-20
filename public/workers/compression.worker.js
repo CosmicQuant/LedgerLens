@@ -5,40 +5,50 @@
  */
 
 self.onmessage = async (e) => {
-    const { file, maxWidth = 1920, quality = 0.6, id } = e.data;
+    const { file, maxWidth = 1500, quality = 0.8, id } = e.data;
 
+    let bitmap = null;
     try {
         // 1. Create ImageBitmap (efficient decoding)
-        // If file is already ImageBitmap, this clones it (fast)
-        const bitmap = file instanceof ImageBitmap ? file : await createImageBitmap(file);
+        // file can be a File, Blob, or ImageBitmap
+        bitmap = file instanceof ImageBitmap ? file : await createImageBitmap(file);
 
-        // 2. Calculate dimensions
-        let width = bitmap.width;
-        let height = bitmap.height;
+        // 2. Calculate professional proportional resizing
+        let targetWidth = bitmap.width;
+        let targetHeight = bitmap.height;
 
-        if (width > maxWidth || height > maxWidth) {
-            const ratio = maxWidth / Math.max(width, height);
-            width *= ratio;
-            height *= ratio;
+        if (targetWidth > maxWidth) {
+            const scale = maxWidth / targetWidth;
+            targetWidth = maxWidth;
+            targetHeight = Math.round(bitmap.height * scale);
         }
 
-        // 3. Use OffscreenCanvas
-        const canvas = new OffscreenCanvas(width, height);
+        // 3. OffscreenCanvas Resizing (Fast, no DOM)
+        const canvas = new OffscreenCanvas(targetWidth, targetHeight);
         const ctx = canvas.getContext('2d');
-        ctx.drawImage(bitmap, 0, 0, width, height);
+
+        // High quality scaling
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+
+        ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
 
         // 4. Compress to Blob
-        const blob = await canvas.convertToBlob({
+        // Convert to blob is async and off-thread
+        const compressedBlob = await canvas.convertToBlob({
             type: 'image/jpeg',
             quality: quality
         });
 
-        // 5. Cleanup
+        // 5. Cleanup memory IMMEDIATELY (Critical for mobile)
         bitmap.close();
+        bitmap = null;
 
-        // 6. Return result
-        self.postMessage({ id, blob, success: true }, [blob]); // Transfer buffer
+        // 6. Return result using Transferable List
+        // We transfer the arrayBuffer of the blob if possible, or just send the blob
+        self.postMessage({ id, blob: compressedBlob, success: true });
     } catch (err) {
+        if (bitmap) bitmap.close();
         self.postMessage({ id, error: err.message, success: false });
     }
 };

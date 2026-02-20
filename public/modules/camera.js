@@ -121,7 +121,7 @@ export function stopCamera(videoElement) {
 }
 
 // ── Frame Capture ────────────────────────────────────────
-
+// A++ Architecture: Offloads encoding to worker via ImageBitmap transfer
 export async function captureFrame(videoElement) {
     if (!state.mediaStream) {
         console.error("No media stream available for capture");
@@ -129,46 +129,38 @@ export async function captureFrame(videoElement) {
     }
 
     try {
-        // ── WORKER PATH (Fastest) ──────────────────────────
-        // Zero-copy transfer if supported by browser
-        if (workerPool.length > 0 && typeof createImageBitmap === 'function') {
-            const bitmap = await createImageBitmap(videoElement);
-            // Offload compression to worker
-            // Note: We use the same compressor, which handles sizing & quality
-            return await compressImageWorker(bitmap);
-        }
+        // 1. Create Bitmap on the main thread (fastest way to "pause" the frame)
+        // This is effectively our "shutter"
+        const bitmap = await createImageBitmap(videoElement);
 
-        // ── FALLBACK PATH (Main Thread) ────────────────────
-        const track = state.mediaStream.getVideoTracks()[0];
-        const settings = track.getSettings();
-
-        const videoWidth = videoElement.videoWidth || settings.width || 1280;
-        const videoHeight = videoElement.videoHeight || settings.height || 720;
-
-        const targetW = MAX_WIDTH;
-        const scale = targetW / videoWidth;
-        const targetH = videoHeight * scale;
-
-        captureCanvas.width = targetW;
-        captureCanvas.height = targetH;
-
-        captureCtx.drawImage(videoElement, 0, 0, targetW, targetH);
-
-        const mime = getPreferredMime();
-        return new Promise(resolve => {
-            captureCanvas.toBlob(blob => {
-                if (!blob || blob.size === 0) {
-                    captureCanvas.toBlob(fb => resolve(fb), 'image/jpeg', COMPRESS_QUALITY);
-                } else {
-                    resolve(blob);
-                }
-            }, mime, COMPRESS_QUALITY);
-        });
-
+        // 2. Hand off to worker for compression
+        // This keeps the UI thread 100% free while the JPEG is generated
+        return await compressImageWorker(bitmap);
     } catch (err) {
-        console.error("Capture error:", err);
-        return null;
+        console.error("[Capture] A++ worker failure:", err);
+        showToast('Camera capture failed (Worker Busy)', 'error');
+        throw err;
     }
+}
+
+async function captureFrameFallback(videoElement) {
+    const track = state.mediaStream.getVideoTracks()[0];
+    const settings = track.getSettings();
+
+    const videoWidth = videoElement.videoWidth || settings.width || 1280;
+    const videoHeight = videoElement.videoHeight || settings.height || 720;
+
+    const targetW = MAX_WIDTH;
+    const scale = targetW / videoWidth;
+    const targetH = videoHeight * scale;
+
+    captureCanvas.width = targetW;
+    captureCanvas.height = targetH;
+    captureCtx.drawImage(videoElement, 0, 0, targetW, targetH);
+
+    return new Promise(resolve => {
+        captureCanvas.toBlob(blob => resolve(blob), getPreferredMime(), COMPRESS_QUALITY);
+    });
 }
 
 // ── Thumbnail Generation ─────────────────────────────────
@@ -218,51 +210,89 @@ const WORKER_COUNT = 2;
 const workerPool = [];
 let workerRR = 0; // Round Robin index
 
+function createWorker(index) {
+    const w = new Worker('./workers/compression.worker.js');
+    console.log(`[Camera] Worker ${index} Spawned 🚀`);
+    return w;
+}
+
 if (typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined') {
     try {
         for (let i = 0; i < WORKER_COUNT; i++) {
-            workerPool.push(new Worker('./workers/compression.worker.js'));
+            workerPool.push(createWorker(i));
         }
-        console.log(`[Camera] Initialized ${workerPool.length} Compression Workers 🚀`);
     } catch (e) {
         console.warn('[Camera] Worker init failed:', e);
     }
 }
 
+function respawnWorker(index) {
+    if (workerPool[index]) {
+        workerPool[index].terminate(); // Double safe
+    }
+    workerPool[index] = createWorker(index);
+}
+
 export async function compressImage(file) {
     if (workerPool.length > 0) {
-        return compressImageWorker(file);
+        // A++ Path: Use ImageBitmap for zero-copy if possible
+        try {
+            const bitmap = await createImageBitmap(file);
+            return await compressImageWorker(bitmap);
+        } catch (e) {
+            console.warn('[Camera] Bitmap creation failed, sending raw blob:', e);
+            return compressImageWorker(file);
+        }
     }
     return compressImageFallback(file);
 }
 
-function compressImageWorker(file) {
-    return new Promise((resolve) => {
+function compressImageWorker(data) {
+    return new Promise((resolve, reject) => {
         // Round Robin Worker Selection
-        const worker = workerPool[workerRR];
+        const currentIdx = workerRR;
+        const worker = workerPool[currentIdx];
         workerRR = (workerRR + 1) % workerPool.length;
 
         const id = Math.random().toString(36).substr(2, 9);
 
+        // A++ Kill & Respawn Timeout (30s)
+        const timeout = setTimeout(() => {
+            worker.removeEventListener('message', handler);
+            console.error(`[A++ Guard] Worker ${currentIdx} HUNG on ${id}. TERMINATING! 🛡️`);
+
+            // 1. Kill the zombie worker
+            worker.terminate();
+
+            // 2. Respawn a clean slate
+            respawnWorker(currentIdx);
+
+            // 3. Quarantine the task (reject)
+            reject(new Error(`Worker Timeout (${id})`));
+        }, 30000);
+
         const handler = (e) => {
             if (e.data.id === id) {
+                clearTimeout(timeout);
                 worker.removeEventListener('message', handler);
                 if (e.data.success) {
+                    console.log(`[Worker] ${id} success (${Math.round(e.data.blob.size / 1024)} KB)`);
                     resolve(e.data.blob);
                 } else {
-                    console.warn('[Worker] Failed, falling back:', e.data.error);
-                    resolve(compressImageFallback(file));
+                    console.error(`[Worker] ${id} Failed:`, e.data.error);
+                    reject(new Error(e.data.error));
                 }
             }
         };
 
+        const transfer = (data instanceof ImageBitmap) ? [data] : [];
         worker.addEventListener('message', handler);
         worker.postMessage({
-            file,
+            file: data,
             id,
             maxWidth: MAX_WIDTH,
             quality: COMPRESS_QUALITY
-        });
+        }, transfer);
     });
 }
 
@@ -318,8 +348,19 @@ export async function compressImageFallback(file) {
 export function blobToImage(blob) {
     return new Promise((resolve, reject) => {
         const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = reject;
+        const timeout = setTimeout(() => {
+            img.src = '';
+            reject(new Error('Image load timeout (10s)'));
+        }, 10000);
+
+        img.onload = () => {
+            clearTimeout(timeout);
+            resolve(img);
+        };
+        img.onerror = (err) => {
+            clearTimeout(timeout);
+            reject(err);
+        };
         img.src = URL.createObjectURL(blob);
     });
 }

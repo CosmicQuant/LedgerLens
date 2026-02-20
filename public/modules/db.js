@@ -1,7 +1,7 @@
 import { openPreview, showToast, updateFinishButton, updateThumbnailStatus } from './ui.js';
 
 const IDB_NAME = 'ledgerlens-db';
-const IDB_VERSION = 1;
+const IDB_VERSION = 2;
 const STORE_NAME = 'receipts';
 
 let idbInstance = null;
@@ -9,11 +9,19 @@ let idbInstance = null;
 export async function getIDB() {
     if (idbInstance) return idbInstance;
     idbInstance = await idb.openDB(IDB_NAME, IDB_VERSION, {
-        upgrade(database) {
-            if (!database.objectStoreNames.contains(STORE_NAME)) {
-                const store = database.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        upgrade(database, oldVersion) {
+            let store;
+            if (oldVersion < 1) {
+                store = database.createObjectStore(STORE_NAME, { keyPath: 'id' });
                 store.createIndex('status', 'status');
                 store.createIndex('batchId', 'batchId');
+            } else {
+                store = database.transaction.objectStore(STORE_NAME);
+            }
+
+            if (oldVersion < 2) {
+                // Composite index for efficient upload and counting
+                store.createIndex('batchId_status', ['batchId', 'status']);
             }
         }
     });
@@ -35,17 +43,51 @@ export async function deleteReceiptFromIDB(id) {
     await database.delete(STORE_NAME, id);
 }
 
-export async function getPendingUploads(batchId) {
+/** 
+ * Returns only a small batch of pending uploads to prevent RAM spikes.
+ * On mobile, fetching 50 high-res blobs into an array kills the tab.
+ */
+export async function getPendingUploads(batchId, limit = 5) {
     const database = await getIDB();
-    let pending = await database.getAllFromIndex(STORE_NAME, 'status', 'pending_upload');
 
-    // Recover receipts stuck in 'uploading' (e.g. app crashed mid-upload)
+    // 1. Recover stuck items first
     const stuck = await database.getAllFromIndex(STORE_NAME, 'status', 'uploading');
     for (const r of stuck) {
-        r.status = 'pending_upload';
-        await database.put(STORE_NAME, r);
+        if (r.batchId === batchId) {
+            r.status = 'pending_upload';
+            await database.put(STORE_NAME, r);
+        }
     }
-    pending = pending.concat(stuck);
 
-    return pending.filter(r => r.batchId === batchId);
+    // 2. Fetch specific batch with limit
+    // We use a cursor to avoid fetching everything into an array
+    const pending = [];
+    let cursor = await database.transaction(STORE_NAME).store.index('batchId_status')
+        .openCursor(IDBKeyRange.only([batchId, 'pending_upload']));
+
+    while (cursor && pending.length < limit) {
+        pending.push(cursor.value);
+        cursor = await cursor.continue();
+    }
+
+    return pending;
+}
+
+/** Efficient counting without fetching blobs */
+export async function getBatchCounts(batchId) {
+    const database = await getIDB();
+    const tx = database.transaction(STORE_NAME, 'readonly');
+    const store = tx.store;
+    const index = store.index('batchId_status');
+
+    const [localCount, pendingCount, uploadingCount] = await Promise.all([
+        store.index('batchId').count(batchId),
+        index.count(IDBKeyRange.only([batchId, 'pending_upload'])),
+        index.count(IDBKeyRange.only([batchId, 'uploading']))
+    ]);
+
+    return {
+        localCount,
+        pendingCount: pendingCount + uploadingCount
+    };
 }

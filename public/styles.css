@@ -655,7 +655,7 @@ body {
 
 .badge-invalid {
   display: none;
-  background: var(--error);
+  background: var(--danger);
   color: white;
   font-size: 0.65rem;
   padding: 2px 4px;
@@ -666,6 +666,45 @@ body {
   z-index: 5;
   font-weight: 700;
   text-transform: uppercase;
+}
+
+.badge-quarantine {
+  display: none;
+  background: var(--danger);
+  color: white;
+  font-size: 0.65rem;
+  padding: 3px 6px;
+  border-radius: 4px;
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 5;
+  font-weight: 700;
+  text-transform: uppercase;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.placeholder-icon {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 32px;
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.q-card.is-placeholder .q-card-inner {
+  background: var(--surface);
+}
+
+.q-card.quarantined .q-card-inner {
+  border: 2px solid var(--danger) !important;
+  opacity: 0.8;
+}
+
+.q-card.quarantined .badge-quarantine {
+  display: block;
 }
 
 .badge-proc {
