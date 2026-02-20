@@ -36,23 +36,6 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-[data-theme="dark"] {
-  --bg-primary: #0d0f1a;
-  --bg-secondary: #151829;
-  --bg-card: #1c2038;
-  --bg-glass: rgba(28, 32, 56, 0.72);
-  --surface: #242844;
-  --border: rgba(255, 255, 255, 0.06);
-  --border-accent: rgba(99, 130, 255, 0.25);
-
-  --text-primary: #e8eaf6;
-  --text-secondary: #9ea4c1;
-  --text-muted: #5c6280;
-
-  --accent: #6382ff;
-  --accent-glow: rgba(99, 130, 255, 0.35);
-}
-
 /* ── Reset ─────────────────────────────────────────── */
 *,
 *::before,
@@ -555,7 +538,7 @@ body {
   z-index: 20;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(to top, rgba(0, 0, 0, 0.9) 0%, rgba(0, 0, 0, 0.6) 50%, transparent 100%);
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.7) 0%, rgba(0, 0, 0, 0.3) 50%, transparent 100%);
   padding-bottom: env(safe-area-inset-bottom);
 }
 
@@ -682,6 +665,45 @@ body {
   font-weight: 700;
   text-transform: uppercase;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.badge-pending {
+  display: none;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 0.65rem;
+  padding: 3px 6px;
+  border-radius: 4px;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  font-weight: 600;
+  border: 1px solid var(--border);
+}
+
+.q-card.is-ghost .badge-pending {
+  display: block;
+}
+
+.q-card.is-ghost .q-card-inner {
+  background: var(--surface);
+  animation: ghost-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes ghost-pulse {
+  0% {
+    background-color: var(--surface);
+  }
+
+  50% {
+    background-color: var(--border);
+  }
+
+  100% {
+    background-color: var(--surface);
+  }
 }
 
 .placeholder-icon {
@@ -861,39 +883,35 @@ body {
   transform: scale(1.05);
 }
 
-/* ── Queue Strip ──────────────────────────────────── */
+/* ── Queue Strip (Ultra Lean Overlay) ───────────────── */
 #queue-strip {
-  padding: 10px 0;
-  /* Remove horiz padding to let list scroll edge-to-edge */
+  padding: 8px 0;
   overflow-x: auto;
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
   background: transparent;
-  /* Let gradient show through */
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
 }
 
 .queue-list {
   display: flex;
   gap: 12px;
-  min-height: 76px;
+  min-height: 80px;
   align-items: center;
   justify-content: flex-start;
-  /* Fix scroll clipping */
   padding: 10px 16px;
-  /* Add horizontal padding for start/end */
 }
 
-/* Thumbnail Card */
 .q-card {
   flex: 0 0 64px;
   width: 64px;
   height: 64px;
   position: relative;
   cursor: pointer;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-  /* Better visibility on video */
+  transition: transform .15s;
+}
+
+.q-card:active {
+  transform: scale(0.92);
 }
 
 .q-card-inner {
@@ -901,8 +919,9 @@ body {
   height: 100%;
   border-radius: var(--radius-sm);
   overflow: hidden;
-  border: 2.5px solid var(--accent);
-  transition: border-color .3s, box-shadow .3s;
+  border: 2px solid var(--border);
+  background: rgba(0, 0, 0, 0.2);
+  /* Subtle placeholder */
   position: relative;
 }
 
@@ -918,75 +937,88 @@ body {
   border-color: var(--ai-sparkle);
 }
 
+.q-card.quarantined .q-card-inner {
+  border-color: var(--danger);
+}
+
 .q-card img {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  transition: opacity .3s;
 }
 
-/* State: Uploading — pulsing ring */
-.q-card.uploading {
-  border-color: var(--warning);
-  animation: pulse-ring 1.2s ease-in-out infinite;
-}
-
-@keyframes pulse-ring {
-
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(255, 200, 92, 0.5);
-  }
-
-  50% {
-    box-shadow: 0 0 0 6px rgba(255, 200, 92, 0);
-  }
-}
-
-/* State: Synced — green check */
-.q-card.synced {
-  border-color: var(--success);
-  animation: none;
-  box-shadow: 0 0 8px var(--success-glow);
-}
-
+/* Status Icons & Badges */
 .q-card .status-icon {
   position: absolute;
   bottom: 2px;
   right: 2px;
-  font-size: 18px;
+  font-size: 16px;
   display: none;
   border-radius: 50%;
-  line-height: 1;
+  background: var(--bg-primary);
+  padding: 1px;
 }
 
-.q-card.synced .status-icon.icon-check {
+.q-card.synced .icon-check {
   display: block;
   color: var(--success);
-  background: var(--bg-primary);
-  padding: 1px;
 }
 
-/* State: AI extracted — sparkle */
-.q-card.extracted {
-  border-color: var(--ai-sparkle);
-  animation: none;
-  box-shadow: 0 0 10px var(--ai-glow);
-}
-
-.q-card.extracted .status-icon.icon-sparkle {
+.q-card.extracted .icon-sparkle {
   display: block;
   color: var(--ai-sparkle);
-  background: var(--bg-primary);
-  padding: 1px;
 }
 
-/* Empty state */
-.queue-empty {
-  width: 100%;
+.badge-proc,
+.badge-invalid,
+.badge-quarantine {
+  position: absolute;
+  inset: 0;
+  display: none !important;
+  align-items: center;
+  justify-content: center;
+  font-size: 8px;
+  font-weight: 800;
+  text-transform: uppercase;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.6);
   text-align: center;
-  color: var(--text-muted);
-  font-size: 13px;
-  letter-spacing: 0.5px;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.q-card.uploading .badge-proc {
+  display: flex !important;
+}
+
+.q-card.quarantined .badge-quarantine {
+  display: flex !important;
+  background: rgba(255, 152, 0, 0.7);
+}
+
+.q-card.error .badge-invalid {
+  display: flex !important;
+  background: rgba(255, 94, 122, 0.7);
+}
+
+.btn-card-del {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  border: 2px solid #fff;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  cursor: pointer;
+  z-index: 100;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
 /* ── Bottom Actions Bar ─────────────────────────── */

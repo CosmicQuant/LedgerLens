@@ -28,21 +28,26 @@ const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
 export class PipelineController {
     constructor() {
-        // --- 1. Engine Limits (Adaptive) ---
-        this.MAX_COMPRESSIONS = IS_MOBILE ? 1 : 2; // CPU Slot Limit
-        this.MAX_UPLOADS = IS_MOBILE ? 2 : 3;      // Network Slot Limit (Modem Guard)
+        // --- 1. Engine Limits (Strict Conveyor Belt Architecture) ---
+        this.MAX_ACTIVE_JOBS = 2; // Never process more than 2 start-to-finish jobs at once
 
         // --- 2. Live Queues ---
-        this.compressQueue = [];
-        this.activeCompressions = 0;
-        this.activeUploads = 0;
+        this.jobQueue = [];
+        this.activeJobs = 0;
 
         // --- 3. Worker Pool ---
         this.workerPool = [];
         this.workerRR = 0;
         this.setupWorkerPool();
 
-        console.log(`[Pipeline] Initialized (CPU Slots: ${this.MAX_COMPRESSIONS}, Network Slots: ${this.MAX_UPLOADS}) 🚀`);
+        this.onDelete = null; // Callback for UI delete buttons
+
+        console.log(`[Pipeline] Initialized (Conveyor Slots: ${this.MAX_ACTIVE_JOBS}) 🚀`);
+    }
+
+    setDeleteCallback(fn) {
+        console.log('[Pipeline] Delete callback linked ✓');
+        this.onDelete = fn;
     }
 
     // ==========================================
@@ -70,104 +75,166 @@ export class PipelineController {
     async handleFiles(files) {
         if (!files || files.length === 0) return;
 
-        showToast(`Processing ${files.length} items…`, 'info');
+        console.log(`[Pipeline] Adding ${files.length} files to conveyor belt...`);
+        showToast(`Adding ${files.length} items to batch…`, 'info');
 
-        this.compressQueue.push(...files);
-        this.processCompressionQueue();
+        // Authoritative bulk increment to prevent flickering
+        batchState.notifyBulkAdd(files.length);
+
+        for (const file of files) {
+            const id = uid();
+            // RULE 1: Ghost UI (Instant Responsiveness)
+            // Add a placeholder card instantly. No image yet.
+            await addThumbnailToQueue(id, null, 'ghost', null, this.onDelete);
+
+            this.jobQueue.push({ id, file });
+        }
+
+        this.processConveyorBelt();
     }
 
     // ==========================================
-    // STAGE 2: Compression Engine (CPU)
+    // STAGE 2: THE CONVEYOR BELT (Strict Concurrency)
     // ==========================================
-    processCompressionQueue() {
-        while (this.activeCompressions < this.MAX_COMPRESSIONS && this.compressQueue.length > 0) {
+    processConveyorBelt() {
+        while (this.activeJobs < this.MAX_ACTIVE_JOBS && this.jobQueue.length > 0) {
             if (batchState.isAtLimit) {
                 showToast('Batch limit reached', 'warning');
-                this.compressQueue = [];
+                this.jobQueue = [];
                 return;
             }
 
-            const file = this.compressQueue.shift();
-            this.activeCompressions++;
+            const job = this.jobQueue.shift();
+            this.activeJobs++;
 
-            this.processSingleItem(file).finally(() => {
-                this.activeCompressions--;
-                // Brief yield for GC before next file
-                setTimeout(() => this.processCompressionQueue(), 50);
+            this.processFullJobPipeline(job).finally(() => {
+                this.activeJobs--;
+                this.processConveyorBelt();
             });
         }
     }
 
-    async processSingleItem(file) {
+    async processFullJobPipeline({ id, file }) {
+        let payloadBlob = file;
+        let thumbBlob = null;
+
         try {
-            const id = uid();
-            state.pendingCount++;
-
-            // 1. Refresh Blob (Android Handle Fix)
-            const freshBlob = file.slice(0, file.size, file.type);
-
-            // 2. Compress (Worker + Tolerant Decoder)
-            const compressedBlob = await this.compressWithTolerantFallback(freshBlob);
-
-            // 3. Generate Thumbnail (Main Thread)
-            let thumbBlob = null;
+            // STEP A: Compression (Worker)
+            // RULE 3: Forgiving Compressor (WhatsApp Fix)
             try {
-                const img = await blobToImage(compressedBlob);
-                thumbBlob = await generateThumbnail(img, false);
-                URL.revokeObjectURL(img.src);
-            } catch (e) {
-                console.warn('[Pipeline] Thumbnail failed:', e);
+                payloadBlob = await this.compressWithTolerantFallback(file);
+            } catch (compressErr) {
+                console.warn(`[Pipeline] Compression failed for ${id}, using raw file:`, compressErr);
+                payloadBlob = file;
             }
 
-            // 4. PERSISTENCE (Crucial for Resilience)
+            // STEP B: Thumbnail Engine
+            try {
+                const img = await blobToImage(payloadBlob);
+                thumbBlob = await generateThumbnail(img, false);
+                URL.revokeObjectURL(img.src);
+            } catch (thumbErr) {
+                console.warn('[Pipeline] Thumbnail failed:', thumbErr);
+            }
+
+            // STEP C: Persistence (IDB)
             const receipt = {
                 id: id,
                 batchId: state.batchId,
-                blob: compressedBlob,
+                blob: payloadBlob,
+                thumbBlob: thumbBlob,
+                status: 'uploading',
+                createdAt: Date.now()
+            };
+            await saveReceiptToIDB(receipt);
+
+            // STEP D: Transform Ghost -> Real UI
+            const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(payloadBlob);
+            state.activeObjectURLs.set(id, displayUrl);
+            await addThumbnailToQueue(id, displayUrl, 'uploading', null, this.onDelete);
+
+            // STEP E: Resumable Upload (Network)
+            await this.uploadWithResumable(id, payloadBlob);
+
+        } catch (err) {
+            console.error(`[Pipeline] Job ${id} failed:`, err);
+            updateThumbnailStatus(id, 'quarantined');
+        }
+    }
+
+    async processSingleItem(blob) {
+        const id = uid();
+        let payloadBlob = blob; // Default to raw original
+        let thumbBlob = null;
+
+        try {
+            // 2. Attempt Compression (Worker)
+            try {
+                payloadBlob = await this.compressWithTolerantFallback(blob);
+            } catch (compressErr) {
+                console.warn(`[Pipeline] Compression failed for ${id}. Switching to BLIND upload:`, compressErr);
+                payloadBlob = blob; // Explicit fallback to raw
+            }
+
+            // 3. Attempt Thumbnail (Main Thread)
+            try {
+                if (payloadBlob.size > 0) {
+                    const img = await blobToImage(payloadBlob);
+                    thumbBlob = await generateThumbnail(img, false);
+                    URL.revokeObjectURL(img.src);
+                }
+            } catch (thumbErr) {
+                console.warn('[Pipeline] Thumbnail skipped (non-critical):', thumbErr);
+                // thumbBlob remains null, UI will use placeholder or raw blob
+            }
+
+            // 4. PERSISTENCE (Always succeeds if IDB is healthy)
+            const receipt = {
+                id: id,
+                batchId: state.batchId,
+                blob: payloadBlob,
                 thumbBlob: thumbBlob,
                 status: 'pending_upload',
                 createdAt: Date.now()
             };
             await saveReceiptToIDB(receipt);
 
-            // 5. Update UI
-            const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(compressedBlob);
+            // 5. Update UI (TURNSTILE GATE)
+            // We await the render completion to ensure the GPU is not overwhelmed 
+            // before we start the next Decode operation.
+            const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(payloadBlob);
             state.activeObjectURLs.set(id, displayUrl);
-            addThumbnailToQueue(id, displayUrl, 'pending_upload', null, null); // Delete logic handled in main.js
 
-            // 6. ZERO-LAG HANDOFF
+            await addThumbnailToQueue(id, displayUrl, 'pending_upload', null, this.onDelete);
+
+            // 6. GPU BREATHE DELAY
+            // Small pause to let the browser's hardware buffers clear and GC handle revoked URLs
+            await new Promise(r => setTimeout(r, 150));
+
+            // 7. ZERO-LAG HANDOFF
             this.processNetworkQueue();
 
         } catch (err) {
-            console.error('[Pipeline] Item failed stage 2:', err);
-            state.pendingCount = Math.max(0, state.pendingCount - 1);
+            console.error('[Pipeline] Critical persistence failure:', err);
+            // Only quarantine if we literally can't save to IDB
+            await addThumbnailToQueue(id, './img/failed-capture.png', 'quarantined', null, this.onDelete);
         }
     }
 
+    /**
+     * Heavy Decode + Compress
+     * Always sends to Worker to protect Main Thread memory.
+     */
     async compressWithTolerantFallback(blob) {
         if (this.workerPool.length === 0) return blob;
 
         const currentIdx = this.workerRR;
         this.workerRR = (this.workerRR + 1) % this.workerPool.length;
 
-        try {
-            // Stage A: High Performance
-            const bitmap = await createImageBitmap(blob);
-            return await this.runWorkerTask(currentIdx, bitmap);
-        } catch (e) {
-            console.warn('[Pipeline] Primary bitmap decode failed, trying Tolerant Decoder:', e);
-            try {
-                // Stage B: Robust Fallback
-                const img = await blobToImage(blob);
-                const bitmap = await createImageBitmap(img);
-                URL.revokeObjectURL(img.src);
-                return await this.runWorkerTask(currentIdx, bitmap);
-            } catch (err2) {
-                console.warn('[Pipeline] Tolerant Decoder failed, trying direct blob:', err2);
-                // Stage C: Worker direct
-                return this.runWorkerTask(currentIdx, blob);
-            }
-        }
+        // SKIP MAIN THREAD DECODE entirely. 
+        // We send the raw blob to the worker. This solves the "InvalidStateError" 
+        // on the main thread and reduces RAM pressure during bulk selection.
+        return await this.runWorkerTask(currentIdx, blob);
     }
 
     runWorkerTask(workerIdx, data) {
@@ -199,89 +266,45 @@ export class PipelineController {
     }
 
     // ==========================================
-    // STAGE 3: Network Engine (Modem Guard)
+    // STAGE 3: RESUMABLE UPLOADER
     // ==========================================
-    async processNetworkQueue() {
-        if (this.activeUploads >= this.MAX_UPLOADS) return;
+    async uploadWithResumable(id, blob) {
+        const ext = getFileExtension();
+        const storagePath = `receipts/${state.batchId}/${id}.${ext}`;
+        const sRef = storage.ref(storagePath);
 
-        const pending = await getPendingUploads(state.batchId, this.MAX_UPLOADS - this.activeUploads);
+        return new Promise((resolve, reject) => {
+            // RULE 4: uploadBytesResumable (Network Resilience)
+            // Note: Using compat 'put' which is actually resumable in some Firebase versions,
+            // but we'll use the clear 'put' with state observation for maximum compatibility.
+            const task = sRef.put(blob, { contentType: ext === 'webp' ? 'image/webp' : 'image/jpeg' });
 
-        if (pending.length === 0) {
-            if (this.activeUploads === 0) {
-                state.isUploading = false;
-                DOM.syncInd.classList.remove('uploading');
-                updateFinishButton(batchState.totalCount, batchState.pendingCount);
+            task.on('state_changed',
+                (snapshot) => {
+                    const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+                    updateThumbnailStatus(id, 'uploading', null, progress);
+                },
+                (error) => {
+                    console.error(`[Pipeline] Upload task failed for ${id}:`, error);
+                    updateThumbnailStatus(id, 'pending_upload');
+                    reject(error);
+                },
+                async () => {
+                    const downloadUrl = await task.snapshot.ref.getDownloadURL();
 
-                // Show completion summary
-                if (batchState.totalCount > 0 && batchState.pendingCount === 0) {
-                    showToast(`Success: All ${batchState.totalCount} receipts are synced.`, 'success');
+                    // Finalize Firestore
+                    await firestore.collection('batches').doc(state.batchId).collection('receipts').doc(id).set({
+                        storageUrl: downloadUrl, storagePath, file_path: storagePath, file_extension: ext,
+                        status: 'synced', extracted: false, uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
+                    });
+
+                    await deleteReceiptFromIDB(id);
+                    batchState.notifyUploadComplete();
+                    updateThumbnailStatus(id, 'synced');
+                    resolve();
                 }
-            }
-            return;
-        }
-
-        if (!state.isUploading) {
-            state.isUploading = true;
-            DOM.syncInd.classList.add('uploading');
-        }
-
-        for (const receipt of pending) {
-            if (this.activeUploads >= this.MAX_UPLOADS) break;
-            this.activeUploads++;
-            this.uploadSingleItem(receipt).finally(() => {
-                this.activeUploads--;
-                this.processNetworkQueue();
-            });
-        }
-    }
-
-    async uploadSingleItem(receipt) {
-        const id = receipt.id;
-        const retry = async (fn, n = 2) => {
-            try { return await fn(); }
-            catch (err) { if (n <= 0) throw err; await new Promise(r => setTimeout(r, 2000)); return retry(fn, n - 1); }
-        };
-
-        try {
-            receipt.status = 'uploading';
-            await saveReceiptToIDB(receipt);
-            updateThumbnailStatus(id, 'uploading');
-
-            const ext = getFileExtension();
-            const storagePath = `receipts/${state.batchId}/${id}.${ext}`;
-            const ref = storage.ref(storagePath);
-
-            const downloadUrl = await retry(async () => {
-                const task = ref.put(receipt.blob, { contentType: ext === 'webp' ? 'image/webp' : 'image/jpeg' });
-                await new Promise((res, rej) => {
-                    task.on('state_changed', (s) => {
-                        updateThumbnailStatus(id, 'uploading', null, (s.bytesTransferred / s.totalBytes) * 100);
-                    }, rej, res);
-                });
-                return await task.snapshot.ref.getDownloadURL();
-            });
-
-            await retry(async () => {
-                await firestore.collection('batches').doc(state.batchId).collection('receipts').doc(id).set({
-                    storageUrl: downloadUrl, storagePath, file_path: storagePath, file_extension: ext,
-                    status: 'synced', extracted: false, uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
-                });
-                await firestore.collection('batches').doc(state.batchId).update({
-                    uploadedCount: firebase.firestore.FieldValue.increment(1)
-                });
-            });
-
-            await deleteReceiptFromIDB(id);
-            state.pendingCount = Math.max(0, state.pendingCount - 1);
-            batchState.notifyUploadComplete();
-            updateThumbnailStatus(id, 'synced');
-
-        } catch (err) {
-            console.error('[Pipeline] Upload failed:', err);
-            receipt.status = 'pending_upload';
-            await saveReceiptToIDB(receipt).catch(() => { });
-            updateThumbnailStatus(id, 'pending_upload');
-        }
+            );
+        });
     }
 }
 

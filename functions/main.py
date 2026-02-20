@@ -217,14 +217,14 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
     """
     Triggered when a receipt image is uploaded to Firebase Storage.
     """
+    if not firebase_admin._apps:
+        initialize_app()
+
     file_path = None
     batch_id = None
     receipt_id = None
     
     try:
-        if not firebase_admin._apps:
-            initialize_app()
-        
         file_path = event.data.name
         bucket_name = event.data.bucket
 
@@ -237,6 +237,20 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
         parts = file_path.split("/")
         if len(parts) < 3: return
         batch_id, receipt_id = parts[1], parts[2].rsplit(".", 1)[0]
+
+        # ── IDEMPOTENT SYNC COUNT ────────────────────────
+        db = firestore.client()
+        receipt_meta_ref = db.collection("batches").document(batch_id).collection("receipts").document(receipt_id)
+        
+        # We use a merge set with a flag to prevent double-counting
+        # even if this storage trigger fires multiple times (e.g. retried put)
+        snap = receipt_meta_ref.get()
+        if not snap.exists or not snap.to_dict().get("is_counted"):
+            print(f"[Counter] Incrementing for {receipt_id}")
+            db.collection("batches").document(batch_id).set({
+                "uploadedCount": firestore.Increment(1)  # type: ignore
+            }, merge=True)
+            receipt_meta_ref.set({"is_counted": True}, merge=True)
 
         process_receipt_extraction(batch_id, receipt_id, bucket_name, file_path)
 
@@ -291,19 +305,22 @@ def process_receipt_extraction(batch_id: str, receipt_id: str, bucket_name: str,
         # ── IDEMPOTENCY CHECK (Cost Optimization) ────────────────
         image_hash_sha256 = hashlib.sha256(image_bytes).hexdigest()
         
-        # Check global receipts for this image hash
-        existing_docs = db.collection_group("receipts")\
-                          .where(filter=FieldFilter("image_hash_sha256", "==", image_hash_sha256))\
-                          .limit(1).get()
-
-        if existing_docs:
-            print(f"[Idempotency] Found match for {image_hash_sha256[:8]}...")
-            existing_data: Optional[Dict[str, Any]] = existing_docs[0].to_dict()
-            
-            if existing_data and existing_data.get("status") == "extracted":
-                print("[Idempotency] Skipping Gemini call. Copying data.")
-                reused_data = existing_data["extractedData"]
-                reused_data["source"] = "cache_hit"
+        # Guard: Don't check duplicates for extremely small files (likely invalid/placeholders)
+        # to avoid "Invalid Image" collisions.
+        if len(image_bytes) > 1024:
+            # Check global receipts for this image hash
+            existing_docs = db.collection_group("receipts")\
+                              .where(filter=FieldFilter("image_hash_sha256", "==", image_hash_sha256))\
+                              .limit(1).get()
+    
+            if existing_docs:
+                print(f"[Idempotency] Found match for {image_hash_sha256[:8]}...")
+                existing_data: Optional[Dict[str, Any]] = existing_docs[0].to_dict()
+                
+                if existing_data and existing_data.get("status") == "extracted":
+                    print("[Idempotency] Skipping Gemini call. Copying data.")
+                    reused_data = existing_data["extractedData"]
+                    reused_data["source"] = "cache_hit"
                 
                 # Check if this is a duplicate in the SAME batch
                 is_duplicate = False

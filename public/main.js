@@ -73,10 +73,9 @@ async function tryRestoreSession() {
     all.sort((a, b) => getTs(b) - getTs(a));
 
     DOM.queueList.innerHTML = '';
-    state.pendingCount = 0;
 
     for (const r of all) {
-      if (r.status === 'pending_upload' || r.status === 'uploading') state.pendingCount++;
+      // let thumbUrl;
 
       let thumbUrl;
       if (r.thumbBlob) {
@@ -115,7 +114,7 @@ async function tryRestoreSession() {
       showToast('Camera access failed, but batch restored.', 'error');
     }
 
-    uploader.processNetworkQueue();
+    uploader.processConveyorBelt();
     return true;
   } catch (e) {
     console.warn('Session restore failed:', e);
@@ -262,8 +261,7 @@ if (DOM.btnSnap) {
       uploader.handleFiles([fullBlob]);
     } catch (err) {
       console.error("[Shutter] A++ Capture Failure:", err);
-      // Inline Error Report: Add to UI even on failure
-      addThumbnailToQueue(uid(), './img/failed-capture.png', 'quarantined', null, deleteReceipt);
+      showToast('Capture error. Trying anyway...', 'warning');
     }
   };
 }
@@ -298,7 +296,9 @@ if ($inputBulk) {
       return;
     }
 
-    $inputBulk.value = '';
+    // Do NOT clear $inputBulk.value = ''; here! 
+    // On Android Chrome, clearing the input can invalidate the File handles 
+    // before the async pipeline can process them.
     uploader.handleFiles(files);
   });
 }
@@ -375,8 +375,8 @@ if (DOM.btnExport) {
   DOM.btnExport.addEventListener('click', async () => {
     // 1. Smart Guard: Check for processing items
     const processingCount = document.querySelectorAll('.is-processing').length;
-    if (processingCount > 0 || state.pendingCount > 0) {
-      alert(`Wait! AI is still labeling ${processingCount || state.pendingCount} receipts.\n\nPlease wait for the "AI Processing" badges to disappear before exporting.`);
+    if (processingCount > 0 || batchState.pendingCount > 0) {
+      alert(`Wait! AI is still labeling ${processingCount || batchState.pendingCount} receipts.\n\nPlease wait for the "AI Processing" badges to disappear before exporting.`);
       return;
     }
 
@@ -633,17 +633,10 @@ async function showHistory() {
 // Initialization
 // ────────────────────────────────────────────────────────
 (async function init() {
-  // Theme
-  const savedTheme = localStorage.getItem('theme') || 'dark';
-  document.documentElement.setAttribute('data-theme', savedTheme);
-  DOM.btnTheme.addEventListener('click', () => {
-    const current = document.documentElement.getAttribute('data-theme');
-    const newTheme = current === 'dark' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', newTheme);
-    localStorage.setItem('theme', newTheme);
-  });
+  // Theme logic removed - app is now permanently light.
 
   try {
+    uploader.setDeleteCallback(deleteReceipt);
     await ensureAuth();
     // Logic moved inside ensureAuth to prevent flicker
   } catch (e) {

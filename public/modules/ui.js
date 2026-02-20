@@ -210,110 +210,161 @@ export function setBatchCompleted(isCompleted) {
 }
 
 export function addThumbnailToQueue(id, thumbUrl, status, firestoreData, onDelete) {
-    // Remove empty-state message if present
-    const empty = DOM.queueList.querySelector('.queue-empty');
-    if (empty) empty.remove();
+    return new Promise((resolve) => {
+        // Remove empty-state message if present
+        const empty = DOM.queueList.querySelector('.queue-empty');
+        if (empty) empty.remove();
 
-    // Prevent duplicates
-    if (document.getElementById(`q-${id}`)) {
+        // Prevent duplicates
+        if (document.getElementById(`q-${id}`)) {
+            updateThumbnailStatus(id, status, firestoreData);
+            resolve();
+            return;
+        }
+
+        const div = document.createElement('div');
+        div.className = `q-card ${status}`;
+        if (status === 'ghost') div.classList.add('is-ghost');
+        div.id = `q-${id}`;
+        div.onclick = () => {
+            if (div.classList.contains('is-ghost')) {
+                showToast('Image processing...', 'info');
+                return;
+            }
+            openPreview(id, thumbUrl, firestoreData);
+        };
+
+        // Inner wrapper for clipping
+        const inner = document.createElement('div');
+        inner.className = 'q-card-inner';
+        div.appendChild(inner);
+
+        // Thumbnail
+        const img = document.createElement('img');
+        const isPlaceholder = !thumbUrl || thumbUrl.includes('failed-capture');
+        const isGhost = status === 'ghost';
+
+        if (isGhost) {
+            img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+            div.classList.add('is-ghost');
+        } else {
+            img.src = isPlaceholder ? 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7' : thumbUrl;
+        }
+
+        // Hardened Error Fallback (Android/WhatsApp InvalidStateError Bypass)
+        img.onerror = () => {
+            console.warn(`[UI] Thumbnail render failed for ${id}. Applying placeholder.`);
+            img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+            div.classList.add('is-placeholder');
+            // Add icon if not already there
+            if (!inner.querySelector('.placeholder-icon')) {
+                const iconFail = document.createElement('span');
+                iconFail.className = 'material-symbols-rounded placeholder-icon';
+                iconFail.textContent = 'unpaved_road';
+                inner.appendChild(iconFail);
+            }
+            resolve(); // Unblock Turnstile
+        };
+
+        img.onload = () => {
+            resolve(); // Unblock Turnstile
+        };
+
+        if (isPlaceholder) div.classList.add('is-placeholder');
+        inner.appendChild(img);
+
+        // Add Placeholder Icon if needed
+        if (isPlaceholder) {
+            const iconFail = document.createElement('span');
+            iconFail.className = 'material-symbols-rounded placeholder-icon';
+            iconFail.textContent = 'unpaved_road'; // Or 'image_not_supported'
+            inner.appendChild(iconFail);
+            // Resolve immediately for base64 placeholders
+            resolve();
+        }
+
+        // Progress Bar
+        const prog = document.createElement('div');
+        prog.className = 'q-prog-bar';
+        inner.appendChild(prog);
+
+        // Status Icons
+        const iconCheck = document.createElement('span');
+        iconCheck.className = 'material-symbols-rounded status-icon icon-check';
+        iconCheck.textContent = 'check_circle';
+        inner.appendChild(iconCheck);
+
+        const iconSparkle = document.createElement('span');
+        iconSparkle.className = 'material-symbols-rounded status-icon icon-sparkle';
+        iconSparkle.textContent = 'auto_awesome';
+        inner.appendChild(iconSparkle);
+
+        const badgeInvalid = document.createElement('div');
+        badgeInvalid.className = 'badge-invalid';
+        badgeInvalid.textContent = 'Invalid';
+        inner.appendChild(badgeInvalid);
+
+        // Processing Badge
+        const badgeProc = document.createElement('div');
+        badgeProc.className = 'badge-proc';
+        badgeProc.textContent = 'AI Processing...';
+        inner.appendChild(badgeProc);
+
+        // Duplicate Badge
+        const badgeDup = document.createElement('div');
+        badgeDup.className = 'badge-duplicate';
+        badgeDup.textContent = 'Duplicate';
+        inner.appendChild(badgeDup);
+
+        // Quarantined Badge
+        const badgeQuarantine = document.createElement('div');
+        badgeQuarantine.className = 'badge-quarantine';
+        badgeQuarantine.textContent = '⚠️ Unreadable';
+        inner.appendChild(badgeQuarantine);
+
+        // Ghost/Pending Badge
+        const badgePending = document.createElement('div');
+        badgePending.className = 'badge-pending';
+        badgePending.textContent = 'Pending...';
+        inner.appendChild(badgePending);
+
+        // Force remove processing if extracted/invalid/error
         updateThumbnailStatus(id, status, firestoreData);
-        return;
-    }
 
-    const div = document.createElement('div');
-    div.className = `q-card ${status}`;
-    div.id = `q-${id}`;
-    div.onclick = () => openPreview(id, thumbUrl, firestoreData);
+        // Check for Error state (New feature from review)
+        if (firestoreData && firestoreData.status === 'error') {
+            div.classList.add('is-invalid'); // Reuse invalid style or add new error style
+            badgeInvalid.textContent = 'Error';
+        }
 
-    // Inner wrapper for clipping
-    const inner = document.createElement('div');
-    inner.className = 'q-card-inner';
-    div.appendChild(inner);
+        // Delete Button
+        const btnDel = document.createElement('button');
+        btnDel.className = 'btn-card-del';
+        btnDel.innerHTML = '<span class="material-symbols-rounded">close</span>';
+        btnDel.title = 'Delete receipt';
+        btnDel.onclick = (e) => {
+            e.stopPropagation();
+            if (onDelete) onDelete(id);
+        };
+        div.appendChild(btnDel);
 
-    // Thumbnail
-    const img = document.createElement('img');
-    const isPlaceholder = !thumbUrl || thumbUrl.includes('failed-capture');
-    img.src = isPlaceholder ? 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7' : thumbUrl;
-    if (isPlaceholder) div.classList.add('is-placeholder');
-    inner.appendChild(img);
+        // Prepend to list (newest first)
+        DOM.queueList.insertBefore(div, DOM.queueList.firstChild);
 
-    // Add Placeholder Icon if needed
-    if (isPlaceholder) {
-        const iconFail = document.createElement('span');
-        iconFail.className = 'material-symbols-rounded placeholder-icon';
-        iconFail.textContent = 'unpaved_road'; // Or 'image_not_supported'
-        inner.appendChild(iconFail);
-    }
-
-    // Progress Bar
-    const prog = document.createElement('div');
-    prog.className = 'q-prog-bar';
-    inner.appendChild(prog);
-
-    // Status Icons
-    const iconCheck = document.createElement('span');
-    iconCheck.className = 'material-symbols-rounded status-icon icon-check';
-    iconCheck.textContent = 'check_circle';
-    inner.appendChild(iconCheck);
-
-    const iconSparkle = document.createElement('span');
-    iconSparkle.className = 'material-symbols-rounded status-icon icon-sparkle';
-    iconSparkle.textContent = 'auto_awesome';
-    inner.appendChild(iconSparkle);
-
-    const badgeInvalid = document.createElement('div');
-    badgeInvalid.className = 'badge-invalid';
-    badgeInvalid.textContent = 'Invalid';
-    inner.appendChild(badgeInvalid);
-
-    // Processing Badge
-    const badgeProc = document.createElement('div');
-    badgeProc.className = 'badge-proc';
-    badgeProc.textContent = 'AI Processing...';
-    inner.appendChild(badgeProc);
-
-    // Duplicate Badge
-    const badgeDup = document.createElement('div');
-    badgeDup.className = 'badge-duplicate';
-    badgeDup.textContent = 'Duplicate';
-    inner.appendChild(badgeDup);
-
-    // Quarantined Badge
-    const badgeQuarantine = document.createElement('div');
-    badgeQuarantine.className = 'badge-quarantine';
-    badgeQuarantine.textContent = '⚠️ Unreadable';
-    inner.appendChild(badgeQuarantine);
-
-    // Force remove processing if extracted/invalid/error
-    updateThumbnailStatus(id, status, firestoreData);
-
-    // Check for Error state (New feature from review)
-    if (firestoreData && firestoreData.status === 'error') {
-        div.classList.add('is-invalid'); // Reuse invalid style or add new error style
-        badgeInvalid.textContent = 'Error';
-    }
-
-    // Delete Button
-    const btnDel = document.createElement('button');
-    btnDel.className = 'btn-card-del';
-    btnDel.innerHTML = '<span class="material-symbols-rounded">close</span>';
-    btnDel.title = 'Delete receipt';
-    btnDel.onclick = (e) => {
-        e.stopPropagation();
-        if (onDelete) onDelete(id);
-    };
-    div.appendChild(btnDel);
-
-    // Prepend to list (newest first)
-    DOM.queueList.insertBefore(div, DOM.queueList.firstChild);
+        // Guard against hung renders
+        setTimeout(resolve, 5000);
+    });
 }
 
 export function updateThumbnailStatus(id, status, firestoreData, uploadProgress) {
     const card = document.getElementById(`q-${id}`);
     if (!card) return;
 
-    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload', 'is-processing', 'is-invalid', 'pending_retry', 'quarantined');
+    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload', 'is-processing', 'is-invalid', 'pending_retry', 'quarantined', 'is-ghost', 'ghost');
     card.classList.add(status);
+
+    if (status === 'ghost') card.classList.add('is-ghost');
+    else card.classList.remove('is-ghost');
 
     if (firestoreData) card._firestoreData = firestoreData;
 
@@ -543,7 +594,6 @@ async function saveReceiptData(id) {
     }
 }
 
-// Force reload modules if they are stuck
 if (!window.location.hash.includes('reloaded')) {
     // Optional: could force reload here, but let's rely on the file rename first.
 }

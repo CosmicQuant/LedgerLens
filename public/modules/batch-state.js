@@ -67,32 +67,38 @@ class BatchStateManager {
         this._recalculating = true;
 
         try {
-            // 1. Efficient Count from IDB (Pending/Uploading)
+            // 1. Get counts from IDB (Pending/Local)
             const stats = await getBatchCounts(this._batchId);
-            this.localCount = stats.localCount; // Total in IDB
-            this.pendingCount = stats.pendingCount; // pending_upload + uploading
+            this.localCount = stats.localCount;
+            this.pendingCount = stats.pendingCount;
 
-            // 2. Count Firestore items for this batch (Synced)
+            // 2. Get authoritative cloud count from Firestore
             if (this._firestore && state.currentUser) {
                 try {
                     const snap = await this._firestore
-                        .collection('batches').doc(this._batchId)
-                        .collection('receipts').get();
-                    this.cloudCount = snap.size;
+                        .collection('batches').doc(this._batchId).get();
+                    if (snap.exists) {
+                        const data = snap.data();
+                        // Use uploadedCount as the authoritative synced number
+                        this.cloudCount = data.uploadedCount || data.receiptCount || 0;
+                    }
                 } catch (e) {
                     console.warn('[BatchState] Firestore count failed:', e.message);
                 }
             }
 
-            // TOTAL = (Already in Cloud) + (Still only in Local)
-            // Note: During upload, an item might be in both for a split second.
-            // But logic-wise, if it's in IDB, it's considered "local" for the UI.
-            // Items are deleted from IDB *after* Firestore success.
-            // So we use max to handle that split-second overlap safely.
-            // Actually, if we want "Total Snapped", we need items that are unique.
-            // Simplest robust way: cloudCount is the floor, localCount is what's added to it.
-            // Since localCount is deleted on sync, total is cloudCount + current pending in IDB.
-            this.totalCount = Math.max(this.cloudCount + this.pendingCount, this.localCount);
+            // STABLE TOTAL LOGIC
+            // Total = (Synced to Cloud) + (Still only in Local IDB)
+            const newTotal = this.cloudCount + this.pendingCount;
+
+            // Stabilize the Denominator (Fix 32 / 0 glitch)
+            // During the upload handoff, pendingCount drops before cloudCount increments. 
+            // We "hold" the totalCount if it's within a small margin of error (2 items)
+            // or if it's an increase (new items added).
+            if (newTotal >= this.totalCount || (this.totalCount - newTotal) > 2) {
+                this.totalCount = newTotal;
+            }
+
             this._notify();
         } finally {
             this._recalculating = false;
@@ -100,9 +106,16 @@ class BatchStateManager {
     }
 
     /**
-     * Quick local increment (optimistic) + async recalculate.
-     * Use after adding a receipt to IDB.
+     * Notify that a large batch of files was added (Gallery Bulk)
      */
+    notifyBulkAdd(count) {
+        this.totalCount += count;
+        this.localCount += count;
+        this.pendingCount += count;
+        this._notify();
+        this.recalculate();
+    }
+
     notifyChange() {
         this.totalCount++;
         this.localCount++;
@@ -111,10 +124,6 @@ class BatchStateManager {
         this.recalculate();
     }
 
-    /**
-     * Quick local decrement (optimistic) + async recalculate.
-     * Use after deleting a receipt.
-     */
     notifyDelete() {
         this.totalCount = Math.max(0, this.totalCount - 1);
         this.localCount = Math.max(0, this.localCount - 1);
@@ -123,14 +132,11 @@ class BatchStateManager {
         this.recalculate();
     }
 
-    /**
-     * Called after a successful upload — local moves to cloud.
-     */
     notifyUploadComplete() {
+        // Just move the internal markers
         this.pendingCount = Math.max(0, this.pendingCount - 1);
         this.cloudCount++;
-        // Total count should stay stable during upload
-        this.totalCount = Math.max(this.totalCount, this.cloudCount + this.pendingCount);
+        // Keep totalCount stable
         this._notify();
     }
 
@@ -143,11 +149,12 @@ class BatchStateManager {
             pendingCount: this.pendingCount,
             syncedCount: this.cloudCount,
             limit: BATCH_LIMIT,
-            remaining: this.remaining,
+            remaining: Math.max(0, BATCH_LIMIT - this.totalCount),
             zone: this.zone,
             isAtLimit: this.isAtLimit,
             canAdd: this.canAdd,
         };
+        console.log('[BatchState] Notify:', payload.syncedCount, '/', payload.totalCount);
         for (const fn of this._subscribers) {
             try { fn(payload); } catch (e) { console.error('[BatchState] subscriber error:', e); }
         }

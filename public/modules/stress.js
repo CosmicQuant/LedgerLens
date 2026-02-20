@@ -92,7 +92,8 @@ export async function runStressTest(count = 10) {
                     status: 'pending_upload',
                     createdAt: Date.now()
                 });
-                state.pendingCount++;
+                // Optimistic increment for the stress test
+                batchState.notifyBulkAdd(1);
             })());
         }
         await Promise.all(chunk);
