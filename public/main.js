@@ -275,6 +275,8 @@ if ($btnGallery) {
     showToast('Opening Gallery...', 'info');
     $btnGallery.disabled = true;
     setTimeout(() => $btnGallery.disabled = false, 3000);
+    // V39 FIX: Do NOT wipe $inputBulk.value here! 
+    // This instantly kills OS file descriptors for the active batch.
     $inputBulk.click();
   });
 }
@@ -296,9 +298,9 @@ if ($inputBulk) {
       return;
     }
 
-    // Do NOT clear $inputBulk.value = ''; here! 
-    // On Android Chrome, clearing the input can invalidate the File handles 
-    // before the async pipeline can process them.
+    // DO NOT clear $inputBulk.value here on Android!
+    // Clearing it synchronously invalidates the active File handles for the worker/canvas.
+    // The wipe now safely happens when the user clicks the Gallery button again.
     uploader.handleFiles(files);
   });
 }
@@ -317,6 +319,9 @@ if ($inputBulk) {
 // Delete Receipt
 async function deleteReceipt(id) {
   if (!confirm('Delete this receipt permanently?')) return;
+
+  // PILLAR 8: Pre-emptive Task Cancellation
+  uploader.cancelJob(id);
 
   const card = document.getElementById(`q-${id}`);
   const storagePath = card?._firestoreData?.storagePath;
@@ -352,6 +357,9 @@ async function deleteReceipt(id) {
     showToast('Failed to delete resource', 'error');
   }
 }
+
+// Map the UI delete buttons to the Pipeline
+uploader.setDeleteCallback(deleteReceipt);
 
 // Finish Batch
 DOM.btnFinish.addEventListener('click', async () => {

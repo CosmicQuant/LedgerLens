@@ -37,6 +37,11 @@ export const DOM = {
     userDisplayEmail: document.getElementById('user-display-email'),
     loader: document.getElementById('global-loader'),
     loaderText: document.getElementById('global-loader-text'),
+    // v33 Scoreboard
+    scoreboard: document.getElementById('batch-progress-wrap'),
+    scoreText: document.getElementById('batch-status-text'),
+    scoreCount: document.getElementById('batch-status-count'),
+    scoreBar: document.getElementById('batch-progress-bar'),
 };
 
 export function showLoader(msg = 'Loading...') {
@@ -196,6 +201,19 @@ export function updateUsageMeter({ totalCount, syncedCount, pendingCount, limit,
     }
     if (DOM.btnGallery) {
         DOM.btnGallery.classList.toggle('at-limit', isAtLimit);
+    }
+
+    // Master Scoreboard (v33)
+    if (DOM.scoreboard) {
+        const isProcessing = pendingCount > 0;
+        DOM.scoreboard.style.display = isProcessing ? 'flex' : 'none';
+
+        if (isProcessing) {
+            DOM.scoreCount.textContent = `${syncedCount} / ${totalCount}`;
+            const percent = totalCount > 0 ? (syncedCount / totalCount) * 100 : 0;
+            DOM.scoreBar.style.width = `${percent}%`;
+            DOM.scoreText.textContent = syncedCount === totalCount ? 'All Synced ✓' : 'Syncing Batch...';
+        }
     }
 }
 
@@ -360,7 +378,7 @@ export function updateThumbnailStatus(id, status, firestoreData, uploadProgress)
     const card = document.getElementById(`q-${id}`);
     if (!card) return;
 
-    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload', 'is-processing', 'is-invalid', 'pending_retry', 'quarantined', 'is-ghost', 'ghost');
+    card.classList.remove('uploading', 'synced', 'extracted', 'pending_upload', 'is-processing', 'is-invalid', 'pending_retry', 'quarantined', 'is-ghost', 'ghost', 'compressing', 'processing');
     card.classList.add(status);
 
     if (status === 'ghost') card.classList.add('is-ghost');
@@ -374,15 +392,16 @@ export function updateThumbnailStatus(id, status, firestoreData, uploadProgress)
     const hasError = status === 'error' || (firestoreData && firestoreData.status === 'error');
     const isInvalid = firestoreData && firestoreData.extractedData && firestoreData.extractedData.category === 'Invalid';
 
-    if (!isActuallyExtracted && !hasError && !isInvalid && !card.classList.contains('duplicate') && (status === 'synced' || status === 'uploaded' || status === 'uploading' || status === 'pending_retry' || status === 'processing')) {
+    if (!isActuallyExtracted && !hasError && !isInvalid && !card.classList.contains('duplicate') && (status === 'synced' || status === 'uploaded' || status === 'uploading' || status === 'pending_retry' || status === 'processing' || status === 'compressing')) {
         card.classList.add('is-processing');
 
-        // Granular Labels (New Feature)
+        // Granular Labels (v33)
         const badgeProc = card.querySelector('.badge-proc');
         if (badgeProc) {
-            if (status === 'uploading') badgeProc.textContent = 'Uploading...';
+            if (status === 'compressing') badgeProc.innerHTML = '<span class="material-symbols-rounded" style="font-size:10px;vertical-align:middle;">settings</span> Compressing...';
+            else if (status === 'uploading') badgeProc.innerHTML = '<span class="material-symbols-rounded" style="font-size:10px;vertical-align:middle;">upload</span> Uploading...';
             else if (status === 'synced' || status === 'uploaded') badgeProc.textContent = 'Uploaded';
-            else if (status === 'processing') badgeProc.textContent = 'Extracting...';
+            else if (status === 'processing') badgeProc.innerHTML = '<span class="material-symbols-rounded" style="font-size:10px;vertical-align:middle;">auto_awesome</span> Extracting...';
             else if (status === 'pending_retry') badgeProc.textContent = 'Retrying...';
             else badgeProc.textContent = 'AI Processing...';
         }

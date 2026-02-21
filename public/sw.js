@@ -1,9 +1,10 @@
-const CACHE_NAME = 'ledgerlens-v29';
+const CACHE_NAME = 'ledgerlens-v47';
 const ASSETS = [
     '/',
     '/index.html',
     '/styles.css',
-    '/main.js',
+    '/main.js?v=47',
+    '/app.js?v=46',
     '/modules/config.js',
     '/modules/firebase-init.js',
     '/modules/state.js',
@@ -11,7 +12,9 @@ const ASSETS = [
     '/modules/db.js',
     '/modules/camera.js',
     '/modules/ui.js',
+    '/modules/uploader.js',
     '/modules/sync.js',
+    '/modules/utils.js',
     '/modules/utils.js',
     'https://cdn.jsdelivr.net/npm/idb@8/build/umd.js',
     'https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap',

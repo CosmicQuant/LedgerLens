@@ -630,6 +630,73 @@ body {
   }
 }
 
+/* ── Master Scoreboard (v33) ─────────────────────── */
+#batch-progress-wrap {
+  position: absolute;
+  top: 75px;
+  /* Below top bar */
+  left: 16px;
+  right: 16px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  z-index: 25;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: slide-down 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slide-down {
+  from {
+    transform: translateY(-20px);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+#batch-status-text {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+#batch-status-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.progress-track {
+  width: 100%;
+  height: 6px;
+  background: var(--surface);
+  border-radius: 100px;
+  overflow: hidden;
+}
+
+#batch-progress-bar {
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--ai-sparkle));
+  transition: width 0.4s cubic-bezier(0.1, 0.7, 0.1, 1);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
 /* ── Queue Item Status ───────────────────────────── */
 .q-card.is-invalid .q-card-inner {
   border: 2px solid #ff4d4d !important;
@@ -742,6 +809,21 @@ body {
   z-index: 5;
   font-weight: 600;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  transition: background 0.3s;
+}
+
+/* Color Coding for v33 */
+.q-card.compressing .badge-proc {
+  background: var(--warning) !important;
+  color: #000 !important;
+}
+
+.q-card.uploading .badge-proc {
+  background: var(--accent) !important;
+}
+
+.q-card.processing .badge-proc {
+  background: var(--ai-sparkle) !important;
 }
 
 .btn-card-del {

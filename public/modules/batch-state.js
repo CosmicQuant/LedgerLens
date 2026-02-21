@@ -18,9 +18,11 @@ class BatchStateManager {
         this._firestore = null;
         this.localCount = 0;
         this.cloudCount = 0;
-        this.totalCount = 0;
         this.pendingCount = 0;
-        this._subscribers = [];
+        this.totalCount = 0;
+        this.ghostCount = 0; // Tracks items in memory before IDB save
+
+        this.subscribers = new Set();
         this._recalculating = false;
     }
 
@@ -32,13 +34,14 @@ class BatchStateManager {
         this.cloudCount = 0;
         this.totalCount = 0;
         this.pendingCount = 0;
+        this.ghostCount = 0;
     }
 
     /** Register a callback: fn({ totalCount, localCount, cloudCount, pendingCount, limit, zone }) */
     subscribe(fn) {
-        this._subscribers.push(fn);
+        this.subscribers.add(fn);
         return () => {
-            this._subscribers = this._subscribers.filter(f => f !== fn);
+            this.subscribers.delete(fn);
         };
     }
 
@@ -69,8 +72,7 @@ class BatchStateManager {
         try {
             // 1. Get counts from IDB (Pending/Local)
             const stats = await getBatchCounts(this._batchId);
-            this.localCount = stats.localCount;
-            this.pendingCount = stats.pendingCount;
+            this.localCount = stats.localCount; // Keep localCount for now, though pendingCount is more detailed
 
             // 2. Get authoritative cloud count from Firestore
             if (this._firestore && state.currentUser) {
@@ -88,16 +90,21 @@ class BatchStateManager {
             }
 
             // STABLE TOTAL LOGIC
-            // Total = (Synced to Cloud) + (Still only in Local IDB)
+            // Total = (Synced to Cloud) + (Still only in Local IDB) + (Ghosts in memory)
+            // 'stats' from getBatchCounts only contains localCount and pendingCount
+            this.pendingCount = stats.pendingCount + this.ghostCount;
             const newTotal = this.cloudCount + this.pendingCount;
 
-            // Stabilize the Denominator (Fix 32 / 0 glitch)
-            // During the upload handoff, pendingCount drops before cloudCount increments. 
+            // Update totalCount directly. We previously had a guard here that caused
+            // "upward drift" (permanent doubling) during rapid uploads.
+            this.totalCount = newTotal;
             // We "hold" the totalCount if it's within a small margin of error (2 items)
             // or if it's an increase (new items added).
-            if (newTotal >= this.totalCount || (this.totalCount - newTotal) > 2) {
-                this.totalCount = newTotal;
-            }
+            // This logic is now redundant with the direct assignment above, but kept for historical context if needed.
+            // The direct assignment `this.totalCount = newTotal;` is the primary update.
+            // if (newTotal >= this.totalCount || (this.totalCount - newTotal) > 2) {
+            //     this.totalCount = newTotal;
+            // }
 
             this._notify();
         } finally {
@@ -109,10 +116,14 @@ class BatchStateManager {
      * Notify that a large batch of files was added (Gallery Bulk)
      */
     notifyBulkAdd(count) {
-        this.totalCount += count;
-        this.localCount += count;
-        this.pendingCount += count;
-        this._notify();
+        if (!this._batchId) return;
+        this.ghostCount += count;
+        this.recalculate();
+    }
+
+    notifyGhostMaterialized(count = 1) {
+        if (!this._batchId) return;
+        this.ghostCount = Math.max(0, this.ghostCount - count);
         this.recalculate();
     }
 
@@ -155,7 +166,7 @@ class BatchStateManager {
             canAdd: this.canAdd,
         };
         console.log('[BatchState] Notify:', payload.syncedCount, '/', payload.totalCount);
-        for (const fn of this._subscribers) {
+        for (const fn of this.subscribers) {
             try { fn(payload); } catch (e) { console.error('[BatchState] subscriber error:', e); }
         }
     }
@@ -163,8 +174,9 @@ class BatchStateManager {
     reset() {
         this.localCount = 0;
         this.cloudCount = 0;
-        this.totalCount = 0;
         this.pendingCount = 0;
+        this.totalCount = 0;
+        this.ghostCount = 0;
         this._batchId = '';
         this._notify();
     }

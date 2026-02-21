@@ -37,14 +37,15 @@ self.onmessage = async (e) => {
         self.postMessage({ blob: compressedBlob, id: id, success: true });
 
     } catch (error) {
-        // It failed to read the pixels (likely a WhatsApp or Cloud file).
-        // WE DO NOT SKIP IT. We send the ORIGINAL raw file back.
-        console.warn(`[Worker] Raw Bypass for ${id}: ${error.message}`);
+        // It failed to read the pixels (likely a WhatsApp or Cloud file or HEIC).
+        // WE DO NOT SEND THE FILE BACK (prevents DataCloneError in IndexedDB).
+        // We tell the main thread it failed, and it will fall back to its pristine copy.
+        console.warn(`[Worker] Rejecting ${id} to trigger main-thread fallback: ${error.message}`);
 
         self.postMessage({
-            blob: file, // Send the original raw file back!
+            error: error.message,
             id: id,
-            success: true // It's a "success" for the pipeline
+            success: false
         });
     }
 };
