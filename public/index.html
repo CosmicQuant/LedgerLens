@@ -16,7 +16,7 @@
         // Register Service Worker from index_main.html
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/sw.js?v=52')
+                navigator.serviceWorker.register('/sw.js?v=53')
                     .then(reg => console.log('SW registered:', reg.scope))
                     .catch(err => console.log('SW failed:', err));
             });
@@ -52,7 +52,7 @@
     <!-- IDB (IndexedDB wrapper) -->
     <script src="https://cdn.jsdelivr.net/npm/idb@8/build/umd.js"></script>
     <!-- Main App (Module) -->
-    <script type="module" src="main.js?v=52"></script>
+    <script type="module" src="main.js?v=53"></script>
     <style>
         /* Failsafe: Ensure content is visible if JS crashes */
         body {

@@ -571,8 +571,9 @@ export class PipelineController {
             this.uploadTasks.set(id, task);
 
             // 30-SECOND KILL SWITCH
+            let killSwitchTimer;
             const timeoutPromise = new Promise((_, timeoutReject) => {
-                setTimeout(() => {
+                killSwitchTimer = setTimeout(() => {
                     console.error(`[Pipeline] 30-Second Kill Switch Triggered for ${id}.`);
                     if (this.uploadTasks.has(id)) {
                         task.cancel();
@@ -622,6 +623,8 @@ export class PipelineController {
                 resolve();
             } catch (raceError) {
                 reject(raceError);
+            } finally {
+                clearTimeout(killSwitchTimer);
             }
         });
     }
