@@ -16,11 +16,19 @@
         // Register Service Worker from index_main.html
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/sw.js?v=47')
+                navigator.serviceWorker.register('/sw.js?v=52')
                     .then(reg => console.log('SW registered:', reg.scope))
                     .catch(err => console.log('SW failed:', err));
             });
         }
+
+        // --- GLOBAL ERROR DEFENDER ---
+        window.addEventListener('error', function (e) {
+            console.error('[Global Error Defender] Trapped Error:', e.message || 'No message', e.error ? e.error.stack : '');
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+            console.error('[Global Error Defender] Unhandled Promise Rejection:', e.reason ? (e.reason.message || e.reason) : 'No reason', e.reason ? e.reason.stack : '');
+        });
     </script>
     <title>LedgerLens — Receipt Scanner</title>
 
@@ -44,7 +52,7 @@
     <!-- IDB (IndexedDB wrapper) -->
     <script src="https://cdn.jsdelivr.net/npm/idb@8/build/umd.js"></script>
     <!-- Main App (Module) -->
-    <script type="module" src="main.js?v=47"></script>
+    <script type="module" src="main.js?v=52"></script>
     <style>
         /* Failsafe: Ensure content is visible if JS crashes */
         body {
@@ -228,7 +236,6 @@
         </div>
     </div>
 
-    <script src="app.js?v=46"></script>
     <script src="https://unpkg.com/vconsole@latest/dist/vconsole.min.js"></script>
     <script>
         var vConsole = new window.VConsole();

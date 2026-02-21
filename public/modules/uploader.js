@@ -30,7 +30,7 @@ const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 export class PipelineController {
     constructor() {
         // --- 1. Engine Limits (Strict Conveyor Belt Architecture) ---
-        this.MAX_ACTIVE_JOBS = 3; // Upgrade to 3 concurrent jobs for max bandwidth utilization
+        this.MAX_ACTIVE_JOBS = 3; // 3 concurrent jobs for max bandwidth utilization
 
         // --- 2. Live Queues & State ---
         this.jobQueue = [];
@@ -117,17 +117,10 @@ export class PipelineController {
         // Authoritative bulk increment to prevent flickering
         batchState.notifyBulkAdd(validFiles.length);
 
-        // V43 FLAWLESS ARCHITECTURE: DECOUPLED BACKGROUND SPOOLER
-        // 1. The UI instantly updates (no freezing for 100 items).
-        // 2. We do NOT push to the upload queue immediately to avoid race conditions.
-        // 3. We stream the massive Blobs to disk via a 1-by-1 lock (`idbSaveLock`),
-        //    completely avoiding the Android `DataError` / `QuotaExceeded` loop crash.
-
         for (const file of validFiles) {
             const id = uid();
 
             // RULE 1: Ghost UI (Instant Responsiveness)
-            // Add a placeholder card instantly. No image yet.
             await addThumbnailToQueue(id, null, 'ghost', null, this.onDelete);
 
             // Create metadata receipt
@@ -141,11 +134,10 @@ export class PipelineController {
                 createdAt: Date.now()
             };
 
-            // Send the heavy lifting to the background IDB pump.
-            // It will push to `this.jobQueue` only AFTER the file is safely secured.
+            // Send to background spooler
             this._queueIDBSaveAndStartJob(id, receipt, file);
 
-            // A microscopic pause to keep the DOM extremely fluid during massive gallery injections
+            // A microscopic pause to keep the DOM fluid
             await new Promise(r => setTimeout(r, 10));
         }
     }
@@ -154,20 +146,16 @@ export class PipelineController {
     // STAGE 1.5: Non-Blocking SECURE IDB Spooler (V43)
     // ==========================================
     async _queueIDBSaveAndStartJob(id, receipt, volatileFile) {
-        // Enforce a strict 1-by-1 transaction lock for IndexedDB to prevent QuotaExceeded
+        // Enforce a strict 1-by-1 transaction lock for IndexedDB
         if (!this.idbSaveLock) this.idbSaveLock = Promise.resolve();
 
         this.idbSaveLock = this.idbSaveLock.then(async () => {
-            // Anti-Zombie Protection: Did user click "delete" on the ghost card before we got here?
             if (this.cancelledJobs.has(id)) {
                 this.cancelledJobs.delete(id);
-                console.log(`[Pipeline] Skiping IDB save for cancelled zombie job: ${id}`);
                 return;
             }
 
-            // --- V44: INSTANT CLIENT-SIDE THUMBNAILS (Pro Architecture) ---
-            // Gen a 100x100 thumbnail in the background lock BEFORE saving to IDB.
-            // 1-by-1 sequencing implicitly protects RAM from crashing.
+            // --- V44: INSTANT CLIENT-SIDE THUMBNAILS ---
             try {
                 const tempUrl = URL.createObjectURL(volatileFile);
                 const microThumb = await this.generateMicroThumbnail(tempUrl);
@@ -182,33 +170,41 @@ export class PipelineController {
                             card.classList.remove('is-placeholder', 'is-ghost');
                             imgElement.parentElement.classList.remove('is-placeholder');
                             const icon = imgElement.parentElement.querySelector('.placeholder-icon');
-                            if (icon) icon.remove(); // Remove the ghost spinner/icon
+                            if (icon) icon.remove();
                         }
+                    }
+                } else {
+                    // Force fallback if Android rejected the image
+                    const card = document.getElementById(`q-${id}`);
+                    if (card) {
+                        card.classList.remove('is-ghost');
+                        card.classList.add('is-placeholder');
+                        const imgElement = card.querySelector('.thumbnail-img') || card.querySelector('img');
+                        if (imgElement) imgElement.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
                     }
                 }
             } catch (thumbErr) {
-                console.warn(`[Pipeline] Early silent thumbnail generation failed for ${id}`, thumbErr);
+                console.warn(`[Pipeline] Early thumbnail generation failed for ${id}`, thumbErr);
             }
 
             try {
-                // Instantly clone the OS bytes into memory
-                const pristineFile = new Blob([volatileFile], { type: volatileFile.type });
-                receipt.size = pristineFile.size;
-                receipt.blob = pristineFile;
+                // --- V48: COMPRESS BEFORE SPOOLING (Fix for DataError) ---
+                // Shrink 15MB -> ~500KB so we can fit 100 images in IDB
+                const spoolBlob = await this.fastCompressForSpooling(volatileFile);
+
+                receipt.size = spoolBlob.size;
+                receipt.blob = spoolBlob;
 
                 // Write to the physical permanent disk partition
                 await saveReceiptToIDB(receipt);
             } catch (idbErr) {
-                console.warn(`[Pipeline] IDB DataError saving blob for ${id}:`, idbErr, "Falling back to memory pin.");
-                // If the Android device's storage quota explicitly rejects the massive blob loop,
-                // fallback to saving just the metadata, and explicitly pin the OS pointer in memory.
+                console.warn(`[Pipeline] IDB error for ${id}:`, idbErr.message, idbErr.stack);
+                // Fallback: Pin the OS pointer in memory (risky but necessary if disk full)
                 receipt.blob = null;
                 receipt.pinUrl = URL.createObjectURL(volatileFile);
                 await saveReceiptToIDB(receipt);
             }
 
-            // ONLY push to the active job queue when we GUARANTEE it's on disk or pinned.
-            // This permanently eliminates the TypeError null crashes where the queue outran the disk.
             if (!this.cancelledJobs.has(id)) {
                 this.jobQueue.push({ id });
                 this.processConveyorBelt();
@@ -216,6 +212,64 @@ export class PipelineController {
                 this.cancelledJobs.delete(id);
             }
         }).catch(e => console.error("[Pipeline] Critical IDB Queue Failure", e));
+    }
+
+    /**
+     * HELPER: Quick compression before saving to DB
+     * Turns 1.5GB batch into ~50MB batch to fit in Browser Storage
+     */
+    async fastCompressForSpooling(file) {
+        return new Promise((resolve) => {
+            // Safety: If file is small (<2MB), don't waste CPU compressing
+            if (file.size < 2 * 1024 * 1024) return resolve(file);
+
+            const img = new Image();
+            const url = URL.createObjectURL(file);
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                let width = img.width;
+                let height = img.height;
+
+                // Max dimension 1920px (Good balance of quality vs size for storage)
+                const MAX_DIM = 1920;
+                if (width > height && width > MAX_DIM) {
+                    height *= MAX_DIM / width;
+                    width = MAX_DIM;
+                } else if (height > MAX_DIM) {
+                    width *= MAX_DIM / height;
+                    height = MAX_DIM;
+                }
+
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+
+                // Compress to JPEG 70%
+                try {
+                    canvas.toBlob((blob) => {
+                        URL.revokeObjectURL(url);
+                        if (!blob) return resolve(file); // Security fallback
+
+                        // Propagate original metadata
+                        const newFile = new File([blob], file.name, {
+                            type: 'image/jpeg',
+                            lastModified: file.lastModified
+                        });
+                        resolve(newFile);
+                    }, 'image/jpeg', 0.7);
+                } catch (canvasErr) {
+                    console.warn(`[Pipeline] Canvas compression error for ${file.name}`, canvasErr);
+                    URL.revokeObjectURL(url);
+                    resolve(file);
+                }
+            };
+            img.onerror = () => {
+                URL.revokeObjectURL(url);
+                resolve(file); // Fallback to raw if compression fails
+            };
+            img.src = url;
+        });
     }
 
     // ==========================================
@@ -260,14 +314,14 @@ export class PipelineController {
     // ==========================================
     processConveyorBelt() {
         if (this.activeJobs > 0) {
-            this.requestWakeLock(); // PILLAR 5: Wake Lock integration
+            this.requestWakeLock();
         }
 
         while (this.activeJobs < this.MAX_ACTIVE_JOBS && this.jobQueue.length > 0) {
             if (batchState.isAtLimit) {
                 showToast('Batch limit reached', 'warning');
                 this.jobQueue = [];
-                this.fingerprints.clear(); // Free memory
+                this.fingerprints.clear();
                 return;
             }
 
@@ -278,10 +332,9 @@ export class PipelineController {
                 this.activeJobs--;
 
                 if (this.activeJobs === 0 && this.jobQueue.length === 0) {
-                    this.releaseWakeLock(); // Release lock when completely idle
+                    this.releaseWakeLock();
 
                     // V39 STRICT BATCH COMPLETION WIPE:
-                    // Only now is it safe to clear the DOM input and release the OS file descriptors.
                     const inputBulk = document.getElementById('input-bulk');
                     if (inputBulk) inputBulk.value = '';
                 } else {
@@ -298,8 +351,6 @@ export class PipelineController {
             img.onload = () => {
                 const canvas = document.createElement('canvas');
                 const ctx = canvas.getContext('2d');
-
-                // Force a tiny 100x100 thumbnail size
                 const MAX_SIZE = 100;
                 let width = img.width;
                 let height = img.height;
@@ -318,11 +369,15 @@ export class PipelineController {
 
                 canvas.width = width;
                 canvas.height = height;
-                ctx.drawImage(img, 0, 0, width, height);
 
-                // Export as a highly compressed JPEG (quality 0.3)
-                const microBase64 = canvas.toDataURL('image/jpeg', 0.3);
-                resolve(microBase64);
+                try {
+                    ctx.drawImage(img, 0, 0, width, height);
+                    const microBase64 = canvas.toDataURL('image/jpeg', 0.3);
+                    resolve(microBase64);
+                } catch (err) {
+                    console.warn('[Pipeline] MicroThumb generation failed:', err);
+                    resolve(null);
+                }
             };
             img.onerror = () => resolve(null);
             img.src = originalBlobUrl;
@@ -337,18 +392,15 @@ export class PipelineController {
             let storedReceipt = null;
 
             try {
-                // 1. ADD GHOST CARD IMMEDIATELY (Redundant safety, mostly handled by spooler now)
+                // 1. ADD GHOST CARD IMMEDIATELY (Redundant safety)
                 await addThumbnailToQueue(id, null, 'uploading', null, this.onDelete);
 
-                // V43 FIX: WE ARE GUARANTEED DATA NOW
                 // We are GUARANTEED that the data exists because IDB spooler pushed us here.
                 storedReceipt = await getReceiptFromIDB(id);
 
                 if (storedReceipt && storedReceipt.blob) {
                     pristineFile = storedReceipt.blob;
                 } else if (storedReceipt && storedReceipt.pinUrl) {
-                    // We hit a DataError quota limit during spooling, using explicitly pinned memory
-                    // We MUST fetch the `content://` blob securely via fetch
                     try {
                         const response = await fetch(storedReceipt.pinUrl);
                         pristineFile = await response.blob();
@@ -362,18 +414,37 @@ export class PipelineController {
                 fileToUpload = pristineFile;
 
                 // 2. STRICT SEQUENTIAL DECODE & COMPRESS LOCK
-                // This prevents Android GPU QuotaExceededError by processing exactly 1 image at a time
                 await new Promise((lockResolve) => {
                     this.decodeQueue = this.decodeQueue.then(async () => {
                         try {
-                            // Attempt heavily compressed worker
                             updateThumbnailStatus(id, 'compressing');
+                            // NOTE: Since we compressed in the Spooler, this step is fast now!
                             const safeClone = pristineFile.slice(0, pristineFile.size, pristineFile.type);
-                            fileToUpload = await this.compressWithTolerantFallback(safeClone);
+                            const workerResult = await this.compressWithTolerantFallback(safeClone);
+
+                            if (workerResult && workerResult.blob) {
+                                fileToUpload = workerResult.blob;
+                                // Inject thumbnail directly from worker!
+                                if (workerResult.thumbnailUrl) {
+                                    const imgElement = document.querySelector(`#q-${id} .thumbnail-img`) || document.querySelector(`#q-${id} img`);
+                                    if (imgElement) {
+                                        imgElement.src = workerResult.thumbnailUrl;
+                                        const card = document.getElementById(`q-${id}`);
+                                        if (card) {
+                                            card.classList.remove('is-placeholder', 'is-ghost');
+                                            imgElement.parentElement.classList.remove('is-placeholder');
+                                            const icon = imgElement.parentElement.querySelector('.placeholder-icon');
+                                            if (icon) icon.remove();
+                                        }
+                                    }
+                                }
+                            } else {
+                                fileToUpload = workerResult; // Fallback if worker array was empty
+                            }
 
                         } catch (compressionError) {
                             console.warn(`[Pipeline] Compression/Decode failed for ${id}, using raw file:`, compressionError);
-                            fileToUpload = pristineFile; // V39 FIX: use the pristine copy, not the dead file pointer
+                            fileToUpload = pristineFile;
                         }
 
                         lockResolve();
@@ -383,27 +454,21 @@ export class PipelineController {
                     });
                 });
 
-                // 3. Persistence Update (IDB) - upgrade to 'uploading'
+                // 3. Persistence Update (IDB)
                 storedReceipt.status = 'uploading';
                 storedReceipt.size = fileToUpload.size;
                 await saveReceiptToIDB(storedReceipt);
-                batchState.notifyGhostMaterialized(1); // Ghost converted to active state
+                batchState.notifyGhostMaterialized(1);
 
                 // 4. FIREBASE UPLOAD
-                // (uploadWithResumable now has dynamic extension via our recent fix)
                 await this.uploadWithResumable(id, fileToUpload, pristineFile);
 
-                // DATABASE SYNC is handled inside uploadWithResumable's success callback
-
             } catch (fatalError) {
-                // Catch ANY error that happens during upload or DB sync
-                console.error(`[Pipeline] Fatal error processing ${id}:`, fatalError);
+                console.error(`[Pipeline] Fatal error processing ${id}:`, fatalError ? fatalError.message : 'Unknown', fatalError ? fatalError.stack : '');
                 updateThumbnailStatus(id, 'error');
                 batchState.notifyGhostMaterialized(1);
             } finally {
-                // 5. IRONCLAD GARBAGE COLLECTION & QUEUE RELEASE
-
-                // V40 FIX: Release the eager pin lock if IDB fallback was used
+                // 5. IRONCLAD GARBAGE COLLECTION
                 if (storedReceipt && storedReceipt.pinUrl) {
                     URL.revokeObjectURL(storedReceipt.pinUrl);
                 }
@@ -412,24 +477,19 @@ export class PipelineController {
                 this.uploadTasks.delete(id);
 
                 console.log(`[Pipeline] Slot Freed for job: ${id}`);
-                // THIS IS THE MOST IMPORTANT LINE. IT FREES THE SLOT.
                 resolve();
             }
         });
     }
 
     cancelJob(id) {
-        // Anti-Zombie Protection for rapid delete during gallery influx
         this.cancelledJobs.add(id);
-
-        // PILLAR 8: Cancellation integration
         const task = this.uploadTasks.get(id);
         if (task) {
             console.log(`[Pipeline] Cancelling active upload task: ${id}`);
             task.cancel();
             this.uploadTasks.delete(id);
         } else {
-            // It might just be in the active jobQueue waiting for GPU lock
             const idx = this.jobQueue.findIndex(job => job.id === id);
             if (idx > -1) {
                 console.log(`[Pipeline] Removing job ${id} from queue before start`);
@@ -438,77 +498,13 @@ export class PipelineController {
         }
     }
 
-    async processSingleItem(blob) {
-        const id = uid();
-        let payloadBlob = blob; // Default to raw original
-        let thumbBlob = null;
-
-        try {
-            // 2. Attempt Thumbnail (Main Thread) FIRST
-            try {
-                if (blob.size > 0) {
-                    const img = await blobToImage(blob);
-                    thumbBlob = await generateThumbnail(img, false);
-                    URL.revokeObjectURL(img.src);
-                }
-            } catch (thumbErr) {
-                console.warn('[Pipeline] Thumbnail skipped (non-critical):', thumbErr);
-            }
-
-            // 3. Attempt Compression (Worker) via safe clone
-            try {
-                const safeClone = blob.slice(0, blob.size, blob.type);
-                payloadBlob = await this.compressWithTolerantFallback(safeClone);
-            } catch (compressErr) {
-                console.warn(`[Pipeline] Compression failed for ${id}. Switching to BLIND upload:`, compressErr);
-                payloadBlob = blob; // Explicit fallback to pristine raw
-            }
-
-            // 4. PERSISTENCE (Metadata Only)
-            const receipt = {
-                id: id,
-                batchId: state.batchId,
-                size: payloadBlob.size,
-                status: 'pending_upload',
-                createdAt: Date.now()
-            };
-            await saveReceiptToIDB(receipt);
-
-            // 5. Update UI (TURNSTILE GATE)
-            // We await the render completion to ensure the GPU is not overwhelmed 
-            // before we start the next Decode operation.
-            const displayUrl = thumbBlob ? URL.createObjectURL(thumbBlob) : URL.createObjectURL(payloadBlob);
-            state.activeObjectURLs.set(id, displayUrl);
-
-            await addThumbnailToQueue(id, displayUrl, 'pending_upload', null, this.onDelete);
-
-            // 6. GPU BREATHE DELAY
-            // Small pause to let the browser's hardware buffers clear and GC handle revoked URLs
-            await new Promise(r => setTimeout(r, 150));
-
-            // 7. ZERO-LAG HANDOFF
-            this.processNetworkQueue();
-
-        } catch (err) {
-            console.error('[Pipeline] Critical persistence failure:', err);
-            // Only quarantine if we literally can't save to IDB
-            await addThumbnailToQueue(id, './img/failed-capture.png', 'quarantined', null, this.onDelete);
-        }
-    }
-
-    /**
-     * Heavy Decode + Compress
-     * Always sends to Worker to protect Main Thread memory.
-     */
     async compressWithTolerantFallback(blob) {
         if (this.workerPool.length === 0) return blob;
 
         const currentIdx = this.workerRR;
         this.workerRR = (this.workerRR + 1) % this.workerPool.length;
 
-        // SKIP MAIN THREAD DECODE entirely. 
-        // We send the raw blob to the worker. This solves the "InvalidStateError" 
-        // on the main thread and reduces RAM pressure during bulk selection.
+        // Send to worker
         return await this.runWorkerTask(currentIdx, blob);
     }
 
@@ -529,7 +525,7 @@ export class PipelineController {
                     clearTimeout(timeout);
                     worker.removeEventListener('message', handler);
                     if (e.data.success) {
-                        resolve(e.data.blob);
+                        resolve({ blob: e.data.blob, thumbnailUrl: e.data.thumbnailUrl });
                     } else reject(new Error(e.data.error));
                 }
             };
@@ -544,7 +540,6 @@ export class PipelineController {
     // STAGE 3: RESUMABLE UPLOADER
     // ==========================================
     async uploadWithResumable(id, blob, originalFile) {
-        // ISSUE 2 FIX: Derive the actual extension from the blob type, or fallback to the original file name.
         let ext = 'webp';
         let mimeType = 'image/webp';
 
@@ -563,31 +558,24 @@ export class PipelineController {
         const sRef = storage.ref(storagePath);
 
         return new Promise(async (resolve, reject) => {
-
-            // PRE-FLIGHT CHECK (V37 Critical Fix)
-            // If Android Chrome has aggressively closed the Unix file descriptor for this batched file,
-            // passing it to Firebase will silently hang the upload network request forever (0 bytes sent).
-            // This 1-byte read forces a rejection instantly if the file is truly dead/unreadable, freeing the queue.
+            // PRE-FLIGHT CHECK
             try {
                 await blob.slice(0, 1).arrayBuffer();
             } catch (e) {
-                console.error(`[Pipeline] Dead OS File descriptor for ${id}. Upload Impossible.`);
+                console.error(`[Pipeline] Dead OS File descriptor for ${id}.`);
                 updateThumbnailStatus(id, 'error');
                 return reject(new Error('File descriptor closed by mobile OS. Tap to retry.'));
             }
 
-            // RULE 4: uploadBytesResumable (Network Resilience)
             const task = sRef.put(blob, { contentType: mimeType });
-            this.uploadTasks.set(id, task); // Track for cancellation
+            this.uploadTasks.set(id, task);
 
-            // THE 30-SECOND KILL SWITCH (V38)
-            // If Firebase catches a corrupted byte stream, it might spin infinitely without throwing an error.
-            // This race promise guarantees the pipeline slot is violently freed after 30 seconds of absolute silence.
+            // 30-SECOND KILL SWITCH
             const timeoutPromise = new Promise((_, timeoutReject) => {
                 setTimeout(() => {
-                    console.error(`[Pipeline] 30-Second Kill Switch Triggered for ${id}. Firebase Hung.`);
+                    console.error(`[Pipeline] 30-Second Kill Switch Triggered for ${id}.`);
                     if (this.uploadTasks.has(id)) {
-                        task.cancel(); // Force Firebase to stop reading the dead stream
+                        task.cancel();
                     }
                     updateThumbnailStatus(id, 'error');
                     timeoutReject(new Error('Network Upload Timeout'));
@@ -601,12 +589,11 @@ export class PipelineController {
                         updateThumbnailStatus(id, 'uploading', null, progress);
                     },
                     (error) => {
-                        console.error(`[Pipeline] Upload task failed for ${id}:`, error);
-                        updateThumbnailStatus(id, 'error'); // V36 strict error marking
+                        console.error(`[Pipeline] Upload task failed for ${id}:`, error ? error.message : '', error);
+                        updateThumbnailStatus(id, 'error');
                         firebaseReject(error);
                     },
                     async () => {
-                        // Check if it was canceled during the final tick
                         if (task.snapshot.state === 'canceled') {
                             return firebaseReject(new Error('Task Canceled'));
                         }
@@ -614,10 +601,9 @@ export class PipelineController {
                         try {
                             const downloadUrl = await task.snapshot.ref.getDownloadURL();
 
-                            // Finalize Firestore
                             await firestore.collection('batches').doc(state.batchId).collection('receipts').doc(id).set({
                                 storageUrl: downloadUrl, storagePath, file_path: storagePath, file_extension: ext,
-                                status: 'synced', extracted: false, uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
+                                status: 'synced', extracted: false, uploadedAt: window.firebase.firestore.FieldValue.serverTimestamp()
                             });
 
                             await deleteReceiptFromIDB(id);
@@ -631,7 +617,6 @@ export class PipelineController {
                 );
             });
 
-            // Race them! First to throw/resolve wins.
             try {
                 await Promise.race([firebaseUploadPromise, timeoutPromise]);
                 resolve();
@@ -642,5 +627,4 @@ export class PipelineController {
     }
 }
 
-// Singleton Instance
 export const uploader = new PipelineController();

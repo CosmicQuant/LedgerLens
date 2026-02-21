@@ -90,13 +90,12 @@ class BatchStateManager {
             }
 
             // STABLE TOTAL LOGIC
-            // Total = (Synced to Cloud) + (Still only in Local IDB) + (Ghosts in memory)
-            // 'stats' from getBatchCounts only contains localCount and pendingCount
-            this.pendingCount = stats.pendingCount + this.ghostCount;
+            // To prevent UI jitter where a file is counted as both "Ghost" and "Pending"
+            // during the split-second IDB handoff, we ensure pending drops back when ghost decreases.
+            this.pendingCount = stats.pendingCount + Math.max(0, this.ghostCount);
             const newTotal = this.cloudCount + this.pendingCount;
 
-            // Update totalCount directly. We previously had a guard here that caused
-            // "upward drift" (permanent doubling) during rapid uploads.
+            // Strict assignment prevents runaway counts
             this.totalCount = newTotal;
             // We "hold" the totalCount if it's within a small margin of error (2 items)
             // or if it's an increase (new items added).

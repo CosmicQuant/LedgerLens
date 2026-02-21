@@ -100,7 +100,9 @@ export async function startCamera(videoElement, torchButton) {
         try {
             await videoElement.play();
         } catch (err) {
-            console.error('Video play error:', err);
+            if (err.name !== 'AbortError') {
+                console.error('Video play error:', err);
+            }
         }
 
         // Prevent phone sleep
