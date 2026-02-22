@@ -319,25 +319,25 @@ def process_receipt_extraction(batch_id: str, receipt_id: str, bucket_name: str,
                 
                 if existing_data and existing_data.get("status") == "extracted":
                     print("[Idempotency] Skipping Gemini call. Copying data.")
-                    reused_data = existing_data["extractedData"]
+                    reused_data = existing_data.get("extractedData", {})
                     reused_data["source"] = "cache_hit"
                 
-                # Check if this is a duplicate in the SAME batch
-                is_duplicate = False
-                duplicate_of = None
-                try:
-                    existing_ref = existing_docs[0].reference
-                    # reference -> collection(receipts) -> document(batch)
-                    existing_batch_id = existing_ref.parent.parent.id
-                    if existing_batch_id == batch_id:
-                        is_duplicate = True
-                        duplicate_of = existing_docs[0].id
-                        reused_data["flag_duplicate"] = True
-                except Exception as e:
-                    print(f"[Warning] Idempotency batch check failed: {e}")
+                    # Check if this is a duplicate in the SAME batch
+                    is_duplicate = False
+                    duplicate_of = None
+                    try:
+                        existing_ref = existing_docs[0].reference
+                        # reference -> collection(receipts) -> document(batch)
+                        existing_batch_id = existing_ref.parent.parent.id
+                        if existing_batch_id == batch_id:
+                            is_duplicate = True
+                            duplicate_of = existing_docs[0].id
+                            reused_data["flag_duplicate"] = True
+                    except Exception as e:
+                        print(f"[Warning] Idempotency batch check failed: {e}")
 
-                _finalize_extraction(db, batch_id, receipt_id, reused_data, image_hash_sha256, is_duplicate=is_duplicate, duplicate_of=duplicate_of)
-                return
+                    _finalize_extraction(db, batch_id, receipt_id, reused_data, image_hash_sha256, is_duplicate=is_duplicate, duplicate_of=duplicate_of)
+                    return
 
         # ── GEMINI EXTRACTION ────────────────────────────────────
         extracted = extract_receipt_data(image_bytes, custom_categories)

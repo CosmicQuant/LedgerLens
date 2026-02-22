@@ -1,7 +1,7 @@
 import { openPreview, showToast, updateFinishButton, updateThumbnailStatus } from './ui.js';
 
 const IDB_NAME = 'ledgerlens-db';
-const IDB_VERSION = 2;
+const IDB_VERSION = 3;
 const STORE_NAME = 'receipts';
 
 let idbInstance = null;
@@ -23,6 +23,11 @@ export async function getIDB() {
                 // Composite index for efficient upload and counting
                 store.createIndex('batchId_status', ['batchId', 'status']);
             }
+
+            if (oldVersion < 3) {
+                // V68: The RAM Shield / IDB Native Proxy Sandbox
+                database.createObjectStore('raw_files'); // out-of-line keys
+            }
         }
     });
     return idbInstance;
@@ -41,6 +46,20 @@ export async function getReceiptFromIDB(id) {
 export async function deleteReceiptFromIDB(id) {
     const database = await getIDB();
     await database.delete(STORE_NAME, id);
+}
+
+// V68: Native IDB Streamers
+export async function saveRawFileToIDB(id, file) {
+    const database = await getIDB();
+    await database.put('raw_files', file, id);
+}
+export async function getRawFileFromIDB(id) {
+    const database = await getIDB();
+    return await database.get('raw_files', id);
+}
+export async function deleteRawFileFromIDB(id) {
+    const database = await getIDB();
+    await database.delete('raw_files', id);
 }
 
 /** 

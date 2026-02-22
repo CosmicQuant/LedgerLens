@@ -11,7 +11,10 @@ import {
     saveReceiptToIDB,
     getReceiptFromIDB,
     deleteReceiptFromIDB,
-    getPendingUploads
+    getPendingUploads,
+    saveRawFileToIDB,
+    getRawFileFromIDB,
+    deleteRawFileFromIDB
 } from './db.js';
 import {
     DOM,
@@ -93,13 +96,20 @@ export class PipelineController {
             console.warn('[Pipeline] Token refresh failed. Continuing anyway.', err);
         }
 
-        let validFiles = [];
+        if ('wakeLock' in navigator && !this.wakeLock) {
+            this.requestWakeLock();
+        }
 
-        for (const file of files) {
-            // PILLAR 7: Fingerprinting (Silent Duplicate Drop)
+        const validFiles = [];
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            if (!file.type.startsWith('image/')) {
+                console.warn(`[Pipeline] Skipping non-image file: ${file.name}`);
+                continue;
+            }
+
             const fingerprint = `${file.name}-${file.size}-${file.lastModified}`;
             if (this.fingerprints.has(fingerprint)) {
-                console.log(`[Pipeline] Skiping exact duplicate: ${file.name}`);
                 continue;
             }
             this.fingerprints.add(fingerprint);
@@ -111,165 +121,101 @@ export class PipelineController {
             return;
         }
 
-        // Let UI know we are grabbing files to IDB
         showToast(`Importing ${validFiles.length} items to local storage…`, 'info');
-
-        // Authoritative bulk increment to prevent flickering
         batchState.notifyBulkAdd(validFiles.length);
 
+        // ==========================================
+        // V70: RAPID HARDWARE MINIATURIZER
+        // Problem: IDB Proxy took 40 seconds to write 50x 15MB files. The Android 
+        // OS 10-second Pointer Killer deleted handles mid-write!
+        // Solution: We MUST compress the Android Pointers directly in RAM
+        // faster than the 10-second timer. 
+        // ==========================================
         for (const file of validFiles) {
             const id = uid();
-
-            // RULE 1: Ghost UI (Instant Responsiveness)
             await addThumbnailToQueue(id, null, 'ghost', null, this.onDelete);
 
-            // Create metadata receipt
-            const receipt = {
-                id: id,
-                batchId: state.batchId,
-                name: file.name || `gallery_${Date.now()}.jpg`,
-                size: file.size,
-                status: 'queued',
-                blob: null,
-                createdAt: Date.now()
-            };
+            try {
+                // V70: Instant Hardware Decode & Shrink (Takes ~100-200ms per file)
+                // This converts 15MB raw -> 500KB ArrayBuffer safely BEFORE IDB hits.
+                const shrinkResult = await this.fastShrink(file, file.type || 'image/jpeg');
 
-            // Send to background spooler
-            this._queueIDBSaveAndStartJob(id, receipt, file);
+                if (!shrinkResult.buffer) {
+                    throw new Error("FastShrink returned null buffer.");
+                }
 
-            // A microscopic pause to keep the DOM fluid
-            await new Promise(r => setTimeout(r, 10));
+                // We now have a completely disconnected, browser-owned ArrayBuffer!
+                const receipt = {
+                    id: id,
+                    batchId: state.batchId,
+                    name: file.name || `gallery_${Date.now()}.jpg`,
+                    size: shrinkResult.buffer.byteLength,
+                    status: 'queued',
+                    createdAt: Date.now(),
+                    mimeType: file.type || 'image/jpeg',
+                    buffer: shrinkResult.buffer // The 500KB ArrayBuffer
+                };
+
+                this._queueIDBSaveAndStartJob(id, receipt, shrinkResult.thumb);
+
+            } catch (err) {
+                const errName = err.name || 'UnknownError';
+                const errMsg = err.message || 'No message provided';
+                console.error(`[Pipeline Error V70] Rapid Shrink Failed for ${file.name}: ${errName} - ${errMsg}`);
+                updateThumbnailStatus(id, 'error');
+            }
         }
     }
 
     // ==========================================
-    // STAGE 1.5: Non-Blocking SECURE IDB Spooler (V43)
+    // STAGE 1.5: V70 Spooler
     // ==========================================
-    async _queueIDBSaveAndStartJob(id, receipt, volatileFile) {
-        // Enforce a strict 1-by-1 transaction lock for IndexedDB
-        if (!this.idbSaveLock) this.idbSaveLock = Promise.resolve();
+    async _queueIDBSaveAndStartJob(id, receipt, microThumb) {
+        if (this.cancelledJobs.has(id)) {
+            this.cancelledJobs.delete(id);
+            return;
+        }
 
-        this.idbSaveLock = this.idbSaveLock.then(async () => {
-            if (this.cancelledJobs.has(id)) {
-                this.cancelledJobs.delete(id);
-                return;
-            }
+        try {
+            // UI Update: Paint the JIT micro-thumbnail instantly!
 
-            // --- V44: INSTANT CLIENT-SIDE THUMBNAILS ---
-            try {
-                const tempUrl = URL.createObjectURL(volatileFile);
-                const microThumb = await this.generateMicroThumbnail(tempUrl);
-                URL.revokeObjectURL(tempUrl);
-
-                if (microThumb) {
-                    const imgElement = document.querySelector(`#q-${id} .thumbnail-img`) || document.querySelector(`#q-${id} img`);
-                    if (imgElement) {
-                        imgElement.src = microThumb;
-                        const card = document.getElementById(`q-${id}`);
-                        if (card) {
-                            card.classList.remove('is-placeholder', 'is-ghost');
-                            imgElement.parentElement.classList.remove('is-placeholder');
-                            const icon = imgElement.parentElement.querySelector('.placeholder-icon');
-                            if (icon) icon.remove();
-                        }
-                    }
-                } else {
-                    // Force fallback if Android rejected the image
+            if (microThumb) {
+                const imgElement = document.querySelector(`#q-${id} .thumbnail-img`) || document.querySelector(`#q-${id} img`);
+                if (imgElement) {
+                    imgElement.src = microThumb;
                     const card = document.getElementById(`q-${id}`);
                     if (card) {
-                        card.classList.remove('is-ghost');
-                        card.classList.add('is-placeholder');
-                        const imgElement = card.querySelector('.thumbnail-img') || card.querySelector('img');
-                        if (imgElement) imgElement.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+                        card.classList.remove('is-placeholder', 'is-ghost');
+                        imgElement.parentElement.classList.remove('is-placeholder');
+                        const icon = imgElement.parentElement.querySelector('.placeholder-icon');
+                        if (icon) icon.remove();
                     }
                 }
-            } catch (thumbErr) {
-                console.warn(`[Pipeline] Early thumbnail generation failed for ${id}`, thumbErr);
-            }
-
-            try {
-                // --- V48: COMPRESS BEFORE SPOOLING (Fix for DataError) ---
-                // Shrink 15MB -> ~500KB so we can fit 100 images in IDB
-                const spoolBlob = await this.fastCompressForSpooling(volatileFile);
-
-                receipt.size = spoolBlob.size;
-                receipt.blob = spoolBlob;
-
-                // Write to the physical permanent disk partition
-                await saveReceiptToIDB(receipt);
-            } catch (idbErr) {
-                console.warn(`[Pipeline] IDB error for ${id}:`, idbErr.message, idbErr.stack);
-                // Fallback: Pin the OS pointer in memory (risky but necessary if disk full)
-                receipt.blob = null;
-                receipt.pinUrl = URL.createObjectURL(volatileFile);
-                await saveReceiptToIDB(receipt);
-            }
-
-            if (!this.cancelledJobs.has(id)) {
-                this.jobQueue.push({ id });
-                this.processConveyorBelt();
             } else {
-                this.cancelledJobs.delete(id);
+                const card = document.getElementById(`q-${id}`);
+                if (card) {
+                    card.classList.remove('is-ghost');
+                    card.classList.add('is-placeholder');
+                    const imgElement = card.querySelector('.thumbnail-img') || card.querySelector('img');
+                    if (imgElement) imgElement.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+                }
             }
-        }).catch(e => console.error("[Pipeline] Critical IDB Queue Failure", e));
-    }
 
-    /**
-     * HELPER: Quick compression before saving to DB
-     * Turns 1.5GB batch into ~50MB batch to fit in Browser Storage
-     */
-    async fastCompressForSpooling(file) {
-        return new Promise((resolve) => {
-            // Safety: If file is small (<2MB), don't waste CPU compressing
-            if (file.size < 2 * 1024 * 1024) return resolve(file);
+            // 3. STORE AS COMPRESSED ARRAYBUFFER (500KB each, extremely fast!)
+            await saveReceiptToIDB(receipt);
 
-            const img = new Image();
-            const url = URL.createObjectURL(file);
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                let width = img.width;
-                let height = img.height;
+        } catch (spoolErr) {
+            console.error(`[Pipeline] Fatal Binary Spool failure for ${id}: [${spoolErr.name || 'Error'}] ${spoolErr.message || spoolErr}`, spoolErr);
+            updateThumbnailStatus(id, 'error');
+            return;
+        }
 
-                // Max dimension 1920px (Good balance of quality vs size for storage)
-                const MAX_DIM = 1920;
-                if (width > height && width > MAX_DIM) {
-                    height *= MAX_DIM / width;
-                    width = MAX_DIM;
-                } else if (height > MAX_DIM) {
-                    width *= MAX_DIM / height;
-                    height = MAX_DIM;
-                }
-
-                canvas.width = width;
-                canvas.height = height;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0, width, height);
-
-                // Compress to JPEG 70%
-                try {
-                    canvas.toBlob((blob) => {
-                        URL.revokeObjectURL(url);
-                        if (!blob) return resolve(file); // Security fallback
-
-                        // Propagate original metadata
-                        const newFile = new File([blob], file.name, {
-                            type: 'image/jpeg',
-                            lastModified: file.lastModified
-                        });
-                        resolve(newFile);
-                    }, 'image/jpeg', 0.7);
-                } catch (canvasErr) {
-                    console.warn(`[Pipeline] Canvas compression error for ${file.name}`, canvasErr);
-                    URL.revokeObjectURL(url);
-                    resolve(file);
-                }
-            };
-            img.onerror = () => {
-                URL.revokeObjectURL(url);
-                resolve(file); // Fallback to raw if compression fails
-            };
-            img.src = url;
-        });
+        if (!this.cancelledJobs.has(id)) {
+            this.jobQueue.push({ id });
+            this.processConveyorBelt();
+        } else {
+            this.cancelledJobs.delete(id);
+        }
     }
 
     // ==========================================
@@ -344,43 +290,129 @@ export class PipelineController {
         }
     }
 
-    async generateMicroThumbnail(originalBlobUrl) {
-        return new Promise((resolve) => {
-            const img = new Image();
-            img.crossOrigin = "Anonymous";
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                const MAX_SIZE = 100;
-                let width = img.width;
-                let height = img.height;
-
-                if (width > height) {
-                    if (width > MAX_SIZE) {
-                        height *= MAX_SIZE / width;
-                        width = MAX_SIZE;
-                    }
-                } else {
-                    if (height > MAX_SIZE) {
-                        width *= MAX_SIZE / height;
-                        height = MAX_SIZE;
-                    }
-                }
-
-                canvas.width = width;
-                canvas.height = height;
+    async fastShrink(blob, mimeType) {
+        return new Promise(async (resolve) => {
+            try {
+                // ==========================================
+                // V70: DETERMINISTIC C++ MEMORY CONTROL & HARDWARE RESIZE
+                // ==========================================
+                const MAX_DIMENSION = 1920;
+                let bitmap;
 
                 try {
-                    ctx.drawImage(img, 0, 0, width, height);
-                    const microBase64 = canvas.toDataURL('image/jpeg', 0.3);
-                    resolve(microBase64);
-                } catch (err) {
-                    console.warn('[Pipeline] MicroThumb generation failed:', err);
-                    resolve(null);
+                    // Try hardware-accelerated native shrink FIRST
+                    bitmap = await createImageBitmap(blob, { resizeWidth: MAX_DIMENSION });
+                } catch (e) {
+                    // Fallback for older browsers
+                    bitmap = await createImageBitmap(blob);
                 }
-            };
-            img.onerror = () => resolve(null);
-            img.src = originalBlobUrl;
+
+                // V70: Use OffscreenCanvas if available for 10x faster background rendering
+                const isOffscreenSupported = typeof OffscreenCanvas !== 'undefined';
+                let canvas, ctx;
+
+                let width = bitmap.width;
+                let height = bitmap.height;
+
+                // Only resize if the fallback was used (hardware resize failed)
+                if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+                    if (width > height) {
+                        height *= MAX_DIMENSION / width;
+                        width = MAX_DIMENSION;
+                    } else {
+                        width *= MAX_DIMENSION / height;
+                        height = MAX_DIMENSION;
+                    }
+                }
+
+                width = Math.floor(width);
+                height = Math.floor(height);
+
+                if (isOffscreenSupported) {
+                    canvas = new OffscreenCanvas(width, height);
+                    ctx = canvas.getContext('2d', { alpha: false });
+                } else {
+                    canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    ctx = canvas.getContext('2d', { alpha: false });
+                }
+
+                // Unpack the graphics
+                ctx.drawImage(bitmap, 0, 0, width, height);
+
+                // ⚡⚡ RAM ASSASSINATION ⚡⚡ 
+                bitmap.close();
+
+                // 1. Generate 100px MicroThumb
+                const THUMB_MAX = 100;
+                let tWidth = width;
+                let tHeight = height;
+
+                if (tWidth > tHeight) {
+                    tHeight *= THUMB_MAX / tWidth;
+                    tWidth = THUMB_MAX;
+                } else {
+                    tWidth *= THUMB_MAX / tHeight;
+                    tHeight = THUMB_MAX;
+                }
+
+                tWidth = Math.floor(tWidth);
+                tHeight = Math.floor(tHeight);
+
+                let thumbCanvas, thumbCtx;
+                if (isOffscreenSupported) {
+                    thumbCanvas = new OffscreenCanvas(tWidth, tHeight);
+                    thumbCtx = thumbCanvas.getContext('2d', { alpha: false });
+                } else {
+                    thumbCanvas = document.createElement('canvas');
+                    thumbCanvas.width = tWidth;
+                    thumbCanvas.height = tHeight;
+                    thumbCtx = thumbCanvas.getContext('2d', { alpha: false });
+                }
+
+                thumbCtx.drawImage(canvas, 0, 0, tWidth, tHeight);
+
+                // We MUST use FileReader for the thumbnail if it's OffscreenCanvas
+                let thumbUrl = null;
+                if (isOffscreenSupported) {
+                    const thumbBlob = await thumbCanvas.convertToBlob({ type: 'image/jpeg', quality: 0.3 });
+                    const reader = new FileReader();
+                    thumbUrl = await new Promise((res) => {
+                        reader.onload = () => res(reader.result);
+                        reader.readAsDataURL(thumbBlob);
+                    });
+                } else {
+                    thumbUrl = thumbCanvas.toDataURL('image/jpeg', 0.3);
+                }
+
+                // 2. Extract Shrunk ArrayBuffer
+                if (isOffscreenSupported) {
+                    const shrunkBlob = await canvas.convertToBlob({ type: mimeType, quality: 0.85 });
+                    const arrayBuffer = await shrunkBlob.arrayBuffer();
+                    // AGGRESSIVE CANVAS MEMORY CLEANUP
+                    canvas.width = 0; canvas.height = 0;
+                    thumbCanvas.width = 0; thumbCanvas.height = 0;
+                    resolve({ thumb: thumbUrl, buffer: arrayBuffer });
+                } else {
+                    canvas.toBlob((shrunkBlob) => {
+                        // AGGRESSIVE CANVAS MEMORY CLEANUP
+                        canvas.width = 0; canvas.height = 0;
+                        thumbCanvas.width = 0; thumbCanvas.height = 0;
+
+                        if (!shrunkBlob) return resolve({ thumb: thumbUrl, buffer: null });
+
+                        const reader = new FileReader();
+                        reader.onload = () => resolve({ thumb: thumbUrl, buffer: reader.result });
+                        reader.onerror = () => resolve({ thumb: thumbUrl, buffer: null });
+                        reader.readAsArrayBuffer(shrunkBlob);
+                    }, mimeType, 0.85);
+                }
+
+            } catch (err) {
+                console.warn('[Pipeline] FastShrink failed natively:', err);
+                resolve({ thumb: null, buffer: null });
+            }
         });
     }
 
@@ -398,9 +430,22 @@ export class PipelineController {
                 // We are GUARANTEED that the data exists because IDB spooler pushed us here.
                 storedReceipt = await getReceiptFromIDB(id);
 
-                if (storedReceipt && storedReceipt.blob) {
-                    pristineFile = storedReceipt.blob;
+                if (storedReceipt && storedReceipt.buffer) {
+                    // V60: Reconstruct the Blob from the raw ArrayBuffer exactly at the moment of upload
+                    pristineFile = new Blob([storedReceipt.buffer], { type: storedReceipt.mimeType || 'image/jpeg' });
+                } else if (storedReceipt && storedReceipt.blob) {
+                    pristineFile = typeof storedReceipt.blob === 'string'
+                        ? await (await fetch(storedReceipt.blob)).blob()
+                        : storedReceipt.blob;
+                } else if (storedReceipt && storedReceipt.base64Fallback) {
+                    try {
+                        const response = await fetch(storedReceipt.base64Fallback);
+                        pristineFile = await response.blob();
+                    } catch (fetchErr) {
+                        throw new Error(`Failed to read Base64 fallback for ${id} - string corrupted.`);
+                    }
                 } else if (storedReceipt && storedReceipt.pinUrl) {
+                    // Legacy code path in case of weird old cache hits
                     try {
                         const response = await fetch(storedReceipt.pinUrl);
                         pristineFile = await response.blob();
@@ -601,6 +646,10 @@ export class PipelineController {
 
                         try {
                             const downloadUrl = await task.snapshot.ref.getDownloadURL();
+
+                            if (!downloadUrl) {
+                                throw new Error("Upload failed: No URL returned");
+                            }
 
                             await firestore.collection('batches').doc(state.batchId).collection('receipts').doc(id).set({
                                 storageUrl: downloadUrl, storagePath, file_path: storagePath, file_extension: ext,
