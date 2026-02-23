@@ -16,9 +16,32 @@
         // Register Service Worker from index_main.html
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/sw.js?v=73')
-                    .then(reg => console.log('SW registered:', reg.scope))
-                    .catch(err => console.log('SW failed:', err));
+                navigator.serviceWorker.register('/sw.js?v=79')
+                    .then(reg => {
+                        console.log('SW registered:', reg.scope);
+                        reg.onupdatefound = () => {
+                            const newWorker = reg.installing;
+                            if (newWorker) {
+                                newWorker.onstatechange = () => {
+                                    if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                                        console.log('[PWA] New update installed! Waiting for controller to claim...');
+                                    }
+                                };
+                            }
+                        };
+                    })
+                    .catch(err => console.warn('SW failed:', err));
+
+                // The Holy Grail: When the newly downloaded SW claims the client via skipWaiting(),
+                // instantly reload the browser to purge all old cached Javascript files from memory.
+                let refreshing = false;
+                navigator.serviceWorker.addEventListener('controllerchange', () => {
+                    if (!refreshing) {
+                        refreshing = true;
+                        console.warn('[PWA] Controller changed! Hard reloading to apply new code...');
+                        window.location.reload();
+                    }
+                });
             });
         }
 
@@ -52,7 +75,7 @@
     <!-- IDB (IndexedDB wrapper) -->
     <script src="https://cdn.jsdelivr.net/npm/idb@8/build/umd.js"></script>
     <!-- Main App (Module) -->
-    <script type="module" src="main.js?v=73"></script>
+    <script type="module" src="main.js?v=79"></script>
     <style>
         /* Failsafe: Ensure content is visible if JS crashes */
         body {

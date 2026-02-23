@@ -52,30 +52,9 @@ export class PipelineController {
 
         this.setupLifecycle(); // V36 Visibility listener
 
-        // V73: Hardware Component Lifecycle
-        this.setupSharedCanvas();
-
         this.onDelete = null; // Callback for UI delete buttons
 
         console.log(`[Pipeline] Initialized (Conveyor Slots: ${this.MAX_ACTIVE_JOBS}) 🚀`);
-    }
-
-    setupSharedCanvas() {
-        this.supportsOffscreen = typeof OffscreenCanvas !== 'undefined';
-        if (this.supportsOffscreen) {
-            this.sharedCanvas = new OffscreenCanvas(1920, 1080);
-            this.sharedCtx = this.sharedCanvas.getContext('2d', { alpha: false });
-
-            this.sharedThumbCanvas = new OffscreenCanvas(100, 100);
-            this.sharedThumbCtx = this.sharedThumbCanvas.getContext('2d', { alpha: false });
-        } else {
-            this.sharedCanvas = document.createElement('canvas');
-            this.sharedCtx = this.sharedCanvas.getContext('2d', { alpha: false });
-
-            this.sharedThumbCanvas = document.createElement('canvas');
-            this.sharedThumbCtx = this.sharedThumbCanvas.getContext('2d', { alpha: false });
-        }
-        console.log(`[Pipeline] Hardware GPU Graphics Context locked natively.`);
     }
 
     setDeleteCallback(fn) {
@@ -111,128 +90,108 @@ export class PipelineController {
         console.log(`[Pipeline] Analyzing ${files.length} files...`);
 
         // PILLAR 8: Pre-batch Auth Token Refresh
-        try {
-            if (state.currentUser) await state.currentUser.getIdToken(true);
-        } catch (err) {
-            console.warn('[Pipeline] Token refresh failed. Continuing anyway.', err);
-        }
-
+        // 1. WAKE LOCK IMMEDIATELY
         if ('wakeLock' in navigator && !this.wakeLock) {
             this.requestWakeLock();
         }
 
+        // 2. FAST FILTER (Pure JS, no Async)
         const validFiles = [];
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
-            if (!file.type.startsWith('image/')) {
-                console.warn(`[Pipeline] Skipping non-image file: ${file.name}`);
-                continue;
-            }
+            // Skip non-images
+            if (!file.type.startsWith('image/')) continue;
 
+            // Check duplicates
             const fingerprint = `${file.name}-${file.size}-${file.lastModified}`;
-            if (this.fingerprints.has(fingerprint)) {
-                continue;
-            }
+            if (this.fingerprints.has(fingerprint)) continue;
+
             this.fingerprints.add(fingerprint);
             validFiles.push(file);
         }
 
         if (validFiles.length === 0) {
-            showToast('All selected files were duplicates.', 'info');
+            showToast('No new files to add.', 'info');
             return;
         }
 
-        showToast(`Importing ${validFiles.length} items to local storage…`, 'info');
+        showToast(`Vaulting ${validFiles.length} images...`, 'info');
         batchState.notifyBulkAdd(validFiles.length);
 
-        // ==========================================
-        // V72: SEQUENTIAL HARDWARE + SOFTWARE FALLBACK
-        // Problem: V71's Parallel GPU processing exhausted the Android graphics buffer.
-        // Solution: Revert to strict sequential hardware decoding (V70), but if the 
-        // GPU throws a DOMException, instantly catch it and use a Javascript software fallback.
-        // ==========================================
-        for (const file of validFiles) {
-            const id = uid();
-            await addThumbnailToQueue(id, null, 'ghost', null, this.onDelete);
-
-            try {
-                // V72: Sequential Hardware Decode & Shrink (with Software Fallback)
-                const shrinkResult = await this.fastShrink(file, file.type || 'image/jpeg');
-
-                if (!shrinkResult.buffer) {
-                    throw new Error("FastShrink returned null buffer.");
-                }
-
-                const receipt = {
-                    id: id,
+        // 3. UI OPTIMIZATION
+        const queueItems = validFiles.map(file => {
+            return {
+                id: uid(),
+                file: file, // We pass the file down, but DON'T put it in the receipt yet
+                receipt: {
                     batchId: state.batchId,
                     name: file.name || `gallery_${Date.now()}.jpg`,
-                    size: shrinkResult.buffer.byteLength,
+                    size: file.size,
                     status: 'queued',
                     createdAt: Date.now(),
-                    mimeType: file.type || 'image/jpeg',
-                    buffer: shrinkResult.buffer
-                };
+                    mimeType: file.type || 'image/jpeg'
+                    // NOTE: 'blob: file' has been completely removed from here!
+                }
+            };
+        });
 
-                this._queueIDBSaveAndStartJob(id, receipt, shrinkResult.thumb);
+        // 4. RENDER UI IN BACKGROUND
+        requestAnimationFrame(() => {
+            queueItems.forEach(item => {
+                item.receipt.id = item.id;
+                addThumbnailToQueue(item.id, null, 'ghost', null, this.onDelete);
+            });
+        });
 
-            } catch (err) {
-                const errName = err.name || 'UnknownError';
-                const errMsg = err.message || 'No message provided';
-                console.error(`[Pipeline Error V72] Rapid Shrink Failed for ${file.name}: ${errName} - ${errMsg}`);
-                updateThumbnailStatus(id, 'error');
-            }
+        // 5. PARALLEL VAULTING (The "Chunker")
+        const CHUNK_SIZE = 5;
+        for (let i = 0; i < queueItems.length; i += CHUNK_SIZE) {
+            const chunk = queueItems.slice(i, i + CHUNK_SIZE);
+
+            // Pass both the item ID, the RAW OS file, and the receipt metadata
+            await Promise.all(chunk.map(item => this._saveToVault(item.id, item.file, item.receipt)));
         }
+
+        // 6. KICKSTART CONVEYOR
+        this.processConveyorBelt();
     }
 
     // ==========================================
-    // STAGE 1.5: V70 Spooler
+    // NEW HELPER: _saveToVault
     // ==========================================
-    async _queueIDBSaveAndStartJob(id, receipt, microThumb) {
+    async _saveToVault(id, file, receiptBase) {
         if (this.cancelledJobs.has(id)) {
             this.cancelledJobs.delete(id);
             return;
         }
 
         try {
-            // UI Update: Paint the JIT micro-thumbnail instantly!
+            // 1. Convert the OS File pointer into raw binary data (ArrayBuffer)
+            // This is lightning fast, avoids VRAM crashes, and permanently beats the Android security timer!
+            const arrayBuffer = await file.arrayBuffer();
 
-            if (microThumb) {
-                const imgElement = document.querySelector(`#q-${id} .thumbnail-img`) || document.querySelector(`#q-${id} img`);
-                if (imgElement) {
-                    imgElement.src = microThumb;
-                    const card = document.getElementById(`q-${id}`);
-                    if (card) {
-                        card.classList.remove('is-placeholder', 'is-ghost');
-                        imgElement.parentElement.classList.remove('is-placeholder');
-                        const icon = imgElement.parentElement.querySelector('.placeholder-icon');
-                        if (icon) icon.remove();
-                    }
-                }
-            } else {
-                const card = document.getElementById(`q-${id}`);
-                if (card) {
-                    card.classList.remove('is-ghost');
-                    card.classList.add('is-placeholder');
-                    const imgElement = card.querySelector('.thumbnail-img') || card.querySelector('img');
-                    if (imgElement) imgElement.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-                }
+            // 2. Attach the pure binary buffer to the receipt
+            const receiptToSave = {
+                ...receiptBase,
+                buffer: arrayBuffer
+            };
+
+            // 3. DIRECT WRITE TO IDB
+            await saveReceiptToIDB(receiptToSave);
+
+            // 4. Push to processing queue
+            this.jobQueue.push({ id });
+
+            // 5. Update UI from "Ghost" to "Placeholder"
+            const card = document.getElementById(`q-${id}`);
+            if (card) {
+                card.classList.remove('is-ghost');
+                card.classList.add('is-placeholder');
             }
 
-            // 3. STORE AS COMPRESSED ARRAYBUFFER (500KB each, extremely fast!)
-            await saveReceiptToIDB(receipt);
-
-        } catch (spoolErr) {
-            console.error(`[Pipeline] Fatal Binary Spool failure for ${id}: [${spoolErr.name || 'Error'}] ${spoolErr.message || spoolErr}`, spoolErr);
+        } catch (err) {
+            console.error(`[Pipeline] Vault Save Failed ${id}`, err);
             updateThumbnailStatus(id, 'error');
-            return;
-        }
-
-        if (!this.cancelledJobs.has(id)) {
-            this.jobQueue.push({ id });
-            this.processConveyorBelt();
-        } else {
-            this.cancelledJobs.delete(id);
         }
     }
 
@@ -308,127 +267,7 @@ export class PipelineController {
         }
     }
 
-    async fastShrink(blob, mimeType) {
-        return new Promise(async (resolve) => {
-            try {
-                // ==========================================
-                // V70: DETERMINISTIC C++ MEMORY CONTROL & HARDWARE RESIZE
-                // ==========================================
-                const MAX_DIMENSION = 1920;
-                let bitmap = null;
-                let img = null;
 
-                try {
-                    // Try hardware-accelerated native shrink FIRST
-                    bitmap = await createImageBitmap(blob, { resizeWidth: MAX_DIMENSION });
-                } catch (e) {
-                    try {
-                        console.warn('[Pipeline] Hardware decode failed or unavailable, attempting <img> Software Fallback...');
-                        img = new Image();
-                        const url = URL.createObjectURL(blob);
-                        await new Promise((res, rej) => {
-                            img.onload = () => { URL.revokeObjectURL(url); res(); };
-                            img.onerror = (err) => { URL.revokeObjectURL(url); rej(new Error("Image Load Error")); };
-                            img.src = url;
-                        });
-                    } catch (fallbackErr) {
-                        console.error('[Pipeline] Software fallback also failed natively:', fallbackErr);
-                        return resolve({ thumb: null, buffer: null });
-                    }
-                }
-
-                // V73: Singleton Hardware Context
-                const isOffscreenSupported = this.supportsOffscreen;
-                const canvas = this.sharedCanvas;
-                const ctx = this.sharedCtx;
-
-                let width = bitmap ? bitmap.width : img.width;
-                let height = bitmap ? bitmap.height : img.height;
-
-                // Only resize if the fallback was used (hardware resize failed)
-                if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
-                    if (width > height) {
-                        height *= MAX_DIMENSION / width;
-                        width = MAX_DIMENSION;
-                    } else {
-                        width *= MAX_DIMENSION / height;
-                        height = MAX_DIMENSION;
-                    }
-                }
-
-                width = Math.floor(width);
-                height = Math.floor(height);
-
-                // Instantly mutates VRAM block without reallocating pointers
-                canvas.width = width;
-                canvas.height = height;
-
-                // Unpack the graphics
-                ctx.drawImage(bitmap || img, 0, 0, width, height);
-
-                // ⚡⚡ RAM ASSASSINATION ⚡⚡ 
-                if (bitmap) bitmap.close();
-                if (img) img.src = '';
-
-                // 1. Generate 100px MicroThumb
-                const THUMB_MAX = 100;
-                let tWidth = width;
-                let tHeight = height;
-
-                if (tWidth > tHeight) {
-                    tHeight *= THUMB_MAX / tWidth;
-                    tWidth = THUMB_MAX;
-                } else {
-                    tWidth *= THUMB_MAX / tHeight;
-                    tHeight = THUMB_MAX;
-                }
-
-                tWidth = Math.floor(tWidth);
-                tHeight = Math.floor(tHeight);
-
-                const thumbCanvas = this.sharedThumbCanvas;
-                const thumbCtx = this.sharedThumbCtx;
-
-                thumbCanvas.width = tWidth;
-                thumbCanvas.height = tHeight;
-
-                thumbCtx.drawImage(canvas, 0, 0, tWidth, tHeight);
-
-                // We MUST use FileReader for the thumbnail if it's OffscreenCanvas
-                let thumbUrl = null;
-                if (isOffscreenSupported) {
-                    const thumbBlob = await thumbCanvas.convertToBlob({ type: 'image/jpeg', quality: 0.3 });
-                    const reader = new FileReader();
-                    thumbUrl = await new Promise((res) => {
-                        reader.onload = () => res(reader.result);
-                        reader.readAsDataURL(thumbBlob);
-                    });
-                } else {
-                    thumbUrl = thumbCanvas.toDataURL('image/jpeg', 0.3);
-                }
-
-                // 2. Extract Shrunk ArrayBuffer
-                if (isOffscreenSupported) {
-                    const shrunkBlob = await canvas.convertToBlob({ type: mimeType, quality: 0.85 });
-                    const arrayBuffer = await shrunkBlob.arrayBuffer();
-                    resolve({ thumb: thumbUrl, buffer: arrayBuffer });
-                } else {
-                    canvas.toBlob((shrunkBlob) => {
-                        if (!shrunkBlob) return resolve({ thumb: thumbUrl, buffer: null });
-
-                        const reader = new FileReader();
-                        reader.onload = () => resolve({ thumb: thumbUrl, buffer: reader.result });
-                        reader.onerror = () => resolve({ thumb: thumbUrl, buffer: null });
-                        reader.readAsArrayBuffer(shrunkBlob);
-                    }, mimeType, 0.85);
-                }
-
-            } catch (err) {
-                console.warn('[Pipeline] FastShrink failed natively:', err);
-                resolve({ thumb: null, buffer: null });
-            }
-        });
-    }
 
     processFullJobPipeline({ id }) {
         return new Promise(async (resolve) => {
