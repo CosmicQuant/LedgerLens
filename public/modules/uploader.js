@@ -52,9 +52,30 @@ export class PipelineController {
 
         this.setupLifecycle(); // V36 Visibility listener
 
+        // V73: Hardware Component Lifecycle
+        this.setupSharedCanvas();
+
         this.onDelete = null; // Callback for UI delete buttons
 
         console.log(`[Pipeline] Initialized (Conveyor Slots: ${this.MAX_ACTIVE_JOBS}) 🚀`);
+    }
+
+    setupSharedCanvas() {
+        this.supportsOffscreen = typeof OffscreenCanvas !== 'undefined';
+        if (this.supportsOffscreen) {
+            this.sharedCanvas = new OffscreenCanvas(1920, 1080);
+            this.sharedCtx = this.sharedCanvas.getContext('2d', { alpha: false });
+
+            this.sharedThumbCanvas = new OffscreenCanvas(100, 100);
+            this.sharedThumbCtx = this.sharedThumbCanvas.getContext('2d', { alpha: false });
+        } else {
+            this.sharedCanvas = document.createElement('canvas');
+            this.sharedCtx = this.sharedCanvas.getContext('2d', { alpha: false });
+
+            this.sharedThumbCanvas = document.createElement('canvas');
+            this.sharedThumbCtx = this.sharedThumbCanvas.getContext('2d', { alpha: false });
+        }
+        console.log(`[Pipeline] Hardware GPU Graphics Context locked natively.`);
     }
 
     setDeleteCallback(fn) {
@@ -125,26 +146,23 @@ export class PipelineController {
         batchState.notifyBulkAdd(validFiles.length);
 
         // ==========================================
-        // V70: RAPID HARDWARE MINIATURIZER
-        // Problem: IDB Proxy took 40 seconds to write 50x 15MB files. The Android 
-        // OS 10-second Pointer Killer deleted handles mid-write!
-        // Solution: We MUST compress the Android Pointers directly in RAM
-        // faster than the 10-second timer. 
+        // V72: SEQUENTIAL HARDWARE + SOFTWARE FALLBACK
+        // Problem: V71's Parallel GPU processing exhausted the Android graphics buffer.
+        // Solution: Revert to strict sequential hardware decoding (V70), but if the 
+        // GPU throws a DOMException, instantly catch it and use a Javascript software fallback.
         // ==========================================
         for (const file of validFiles) {
             const id = uid();
             await addThumbnailToQueue(id, null, 'ghost', null, this.onDelete);
 
             try {
-                // V70: Instant Hardware Decode & Shrink (Takes ~100-200ms per file)
-                // This converts 15MB raw -> 500KB ArrayBuffer safely BEFORE IDB hits.
+                // V72: Sequential Hardware Decode & Shrink (with Software Fallback)
                 const shrinkResult = await this.fastShrink(file, file.type || 'image/jpeg');
 
                 if (!shrinkResult.buffer) {
                     throw new Error("FastShrink returned null buffer.");
                 }
 
-                // We now have a completely disconnected, browser-owned ArrayBuffer!
                 const receipt = {
                     id: id,
                     batchId: state.batchId,
@@ -153,7 +171,7 @@ export class PipelineController {
                     status: 'queued',
                     createdAt: Date.now(),
                     mimeType: file.type || 'image/jpeg',
-                    buffer: shrinkResult.buffer // The 500KB ArrayBuffer
+                    buffer: shrinkResult.buffer
                 };
 
                 this._queueIDBSaveAndStartJob(id, receipt, shrinkResult.thumb);
@@ -161,7 +179,7 @@ export class PipelineController {
             } catch (err) {
                 const errName = err.name || 'UnknownError';
                 const errMsg = err.message || 'No message provided';
-                console.error(`[Pipeline Error V70] Rapid Shrink Failed for ${file.name}: ${errName} - ${errMsg}`);
+                console.error(`[Pipeline Error V72] Rapid Shrink Failed for ${file.name}: ${errName} - ${errMsg}`);
                 updateThumbnailStatus(id, 'error');
             }
         }
@@ -297,22 +315,35 @@ export class PipelineController {
                 // V70: DETERMINISTIC C++ MEMORY CONTROL & HARDWARE RESIZE
                 // ==========================================
                 const MAX_DIMENSION = 1920;
-                let bitmap;
+                let bitmap = null;
+                let img = null;
 
                 try {
                     // Try hardware-accelerated native shrink FIRST
                     bitmap = await createImageBitmap(blob, { resizeWidth: MAX_DIMENSION });
                 } catch (e) {
-                    // Fallback for older browsers
-                    bitmap = await createImageBitmap(blob);
+                    try {
+                        console.warn('[Pipeline] Hardware decode failed or unavailable, attempting <img> Software Fallback...');
+                        img = new Image();
+                        const url = URL.createObjectURL(blob);
+                        await new Promise((res, rej) => {
+                            img.onload = () => { URL.revokeObjectURL(url); res(); };
+                            img.onerror = (err) => { URL.revokeObjectURL(url); rej(new Error("Image Load Error")); };
+                            img.src = url;
+                        });
+                    } catch (fallbackErr) {
+                        console.error('[Pipeline] Software fallback also failed natively:', fallbackErr);
+                        return resolve({ thumb: null, buffer: null });
+                    }
                 }
 
-                // V70: Use OffscreenCanvas if available for 10x faster background rendering
-                const isOffscreenSupported = typeof OffscreenCanvas !== 'undefined';
-                let canvas, ctx;
+                // V73: Singleton Hardware Context
+                const isOffscreenSupported = this.supportsOffscreen;
+                const canvas = this.sharedCanvas;
+                const ctx = this.sharedCtx;
 
-                let width = bitmap.width;
-                let height = bitmap.height;
+                let width = bitmap ? bitmap.width : img.width;
+                let height = bitmap ? bitmap.height : img.height;
 
                 // Only resize if the fallback was used (hardware resize failed)
                 if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
@@ -328,21 +359,16 @@ export class PipelineController {
                 width = Math.floor(width);
                 height = Math.floor(height);
 
-                if (isOffscreenSupported) {
-                    canvas = new OffscreenCanvas(width, height);
-                    ctx = canvas.getContext('2d', { alpha: false });
-                } else {
-                    canvas = document.createElement('canvas');
-                    canvas.width = width;
-                    canvas.height = height;
-                    ctx = canvas.getContext('2d', { alpha: false });
-                }
+                // Instantly mutates VRAM block without reallocating pointers
+                canvas.width = width;
+                canvas.height = height;
 
                 // Unpack the graphics
-                ctx.drawImage(bitmap, 0, 0, width, height);
+                ctx.drawImage(bitmap || img, 0, 0, width, height);
 
                 // ⚡⚡ RAM ASSASSINATION ⚡⚡ 
-                bitmap.close();
+                if (bitmap) bitmap.close();
+                if (img) img.src = '';
 
                 // 1. Generate 100px MicroThumb
                 const THUMB_MAX = 100;
@@ -360,16 +386,11 @@ export class PipelineController {
                 tWidth = Math.floor(tWidth);
                 tHeight = Math.floor(tHeight);
 
-                let thumbCanvas, thumbCtx;
-                if (isOffscreenSupported) {
-                    thumbCanvas = new OffscreenCanvas(tWidth, tHeight);
-                    thumbCtx = thumbCanvas.getContext('2d', { alpha: false });
-                } else {
-                    thumbCanvas = document.createElement('canvas');
-                    thumbCanvas.width = tWidth;
-                    thumbCanvas.height = tHeight;
-                    thumbCtx = thumbCanvas.getContext('2d', { alpha: false });
-                }
+                const thumbCanvas = this.sharedThumbCanvas;
+                const thumbCtx = this.sharedThumbCtx;
+
+                thumbCanvas.width = tWidth;
+                thumbCanvas.height = tHeight;
 
                 thumbCtx.drawImage(canvas, 0, 0, tWidth, tHeight);
 
@@ -390,16 +411,9 @@ export class PipelineController {
                 if (isOffscreenSupported) {
                     const shrunkBlob = await canvas.convertToBlob({ type: mimeType, quality: 0.85 });
                     const arrayBuffer = await shrunkBlob.arrayBuffer();
-                    // AGGRESSIVE CANVAS MEMORY CLEANUP
-                    canvas.width = 0; canvas.height = 0;
-                    thumbCanvas.width = 0; thumbCanvas.height = 0;
                     resolve({ thumb: thumbUrl, buffer: arrayBuffer });
                 } else {
                     canvas.toBlob((shrunkBlob) => {
-                        // AGGRESSIVE CANVAS MEMORY CLEANUP
-                        canvas.width = 0; canvas.height = 0;
-                        thumbCanvas.width = 0; thumbCanvas.height = 0;
-
                         if (!shrunkBlob) return resolve({ thumb: thumbUrl, buffer: null });
 
                         const reader = new FileReader();
