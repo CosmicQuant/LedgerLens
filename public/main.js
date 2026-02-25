@@ -1,8 +1,8 @@
 import { state } from './modules/state.js';
 import { db, auth, storage } from './modules/firebase-init.js';
 import { startCamera, stopCamera, captureFrame } from './modules/camera.js';
-import { getIDB, saveReceiptToIDB, deleteReceiptFromIDB } from './modules/db.js';
-import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, updateThumbnailStatus, setBatchCompleted, updateUsageMeter, showLoader, hideLoader, showNotification } from './modules/ui.js';
+import { getIDB, saveReceiptToIDB, deleteReceiptFromIDB, clearIDBForBatch } from './modules/db.js';
+import { DOM, showScreen, showToast, addThumbnailToQueue, updateThumbnailStatus, updateUsageMeter, showLoader, hideLoader, showNotification } from './modules/ui.js';
 import { uploader } from './modules/uploader.js';
 import { uid, sanitizeInput, escapeHtml } from './modules/utils.js';
 import { batchState } from './modules/batch-state.js';
@@ -13,7 +13,11 @@ import { startWatchdog, stopWatchdog } from './modules/watchdog.js';
 // ────────────────────────────────────────────────────────
 batchState.subscribe((payload) => {
   updateUsageMeter(payload);
-  updateFinishButton(payload.totalCount, payload.pendingCount);
+  if (DOM.btnExport) {
+    const processingCount = document.querySelectorAll('.is-processing').length;
+    const busy = payload.totalCount === 0 || payload.pendingCount > 0 || processingCount > 0;
+    DOM.btnExport.disabled = busy;
+  }
 });
 
 // ────────────────────────────────────────────────────────
@@ -47,6 +51,12 @@ async function tryRestoreSession() {
     DOM.lblBatch.textContent = `Batch ${state.batchId.slice(0, 8)}…`;
 
     const database = await getIDB();
+
+    // Purge IDB zombies: any item left in IDB from a previous session is a failed 
+    // or interrupted upload. Since we don't have a resume mechanism, we must 
+    // clear them to prevent them from permanently inflating counts.
+    await clearIDBForBatch(sess.batchId);
+
     const localReceipts = await database.getAllFromIndex('receipts', 'batchId', state.batchId);
 
     const remoteSnap = await db.collection('batches').doc(state.batchId)
@@ -101,7 +111,6 @@ async function tryRestoreSession() {
 
     console.log(`[Restore] Displaying ${all.length} items. UI Screen: Camera.`);
     showScreen(DOM.camera);
-    setBatchCompleted(sess.status === 'completed');
 
     if (window.location.hash !== '#camera') {
       history.pushState({ screen: 'camera' }, 'Camera', '#camera');
@@ -129,11 +138,14 @@ function resetApp(isPopState = false) {
   if (confirm('Exit current batch? Unsynced images will be kept in history.')) {
     stopCamera(DOM.video);
     stopWatchdog();
+
+    // Clean up any pending IDB files before leaving
+    if (state.batchId) clearIDBForBatch(state.batchId);
+
     state.reset();
     batchState.reset();
     showScreen(DOM.setup);
     DOM.queueList.innerHTML = '<span class="queue-empty">Snap a receipt to begin</span>';
-    setBatchCompleted(false);
 
     if (!isPopState && window.location.hash === '#camera') {
       history.back();
@@ -200,7 +212,6 @@ DOM.formSetup.addEventListener('submit', async (e) => {
     state.pendingCount = 0;
     batchState.reset();
     batchState.init(newBatchId, db);
-    setBatchCompleted(false);
 
     // Create batch in Firestore
     try {
@@ -372,23 +383,6 @@ async function deleteReceipt(id) {
 uploader.setDeleteCallback(deleteReceipt);
 
 // Finish Batch
-DOM.btnFinish.addEventListener('click', async () => {
-  if (!confirm(`Finish batch for "${state.clientName}"?`)) return;
-
-  try {
-    await db.collection('batches').doc(state.batchId).update({
-      status: 'completed',
-      completedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      totalReceipts: batchState.totalCount
-    });
-    saveSession('completed');
-    showToast('Batch completed ✓', 'success');
-    setBatchCompleted(true);
-  } catch (err) {
-    showToast('Failed to finalize batch', 'error');
-  }
-});
-
 if (DOM.btnExport) {
   DOM.btnExport.addEventListener('click', async () => {
     // 1. Smart Guard: Check for processing items
@@ -396,6 +390,17 @@ if (DOM.btnExport) {
     if (processingCount > 0 || batchState.pendingCount > 0) {
       alert(`Wait! AI is still labeling ${processingCount || batchState.pendingCount} receipts.\n\nPlease wait for the "AI Processing" badges to disappear before exporting.`);
       return;
+    }
+
+    try {
+      await db.collection('batches').doc(state.batchId).update({
+        status: 'completed',
+        completedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        totalReceipts: batchState.totalCount
+      });
+      saveSession('completed');
+    } catch (err) {
+      console.warn('Failed to update batch completed status:', err);
     }
 
     showToast('Generating Excel report…', 'info', 5000);
@@ -536,6 +541,10 @@ if (DOM.btnHistory) {
 }
 
 async function showHistory() {
+  const PAGE_SIZE = 20;
+  let lastDoc = null;    // Firestore cursor for pagination
+  let isLoading = false;
+
   const historyOverlay = document.createElement('div');
   historyOverlay.className = 'history-overlay active';
   historyOverlay.innerHTML = `
@@ -552,110 +561,154 @@ async function showHistory() {
   document.body.appendChild(historyOverlay);
   document.getElementById('btn-close-history').onclick = () => historyOverlay.remove();
 
-  try {
-    const snap = await db.collection('batches')
-      .where('ownerId', '==', state.currentUser.uid)
-      .orderBy('createdAt', 'desc')
-      .limit(20)
-      .get();
+  const list = document.getElementById('history-list');
 
-    const list = document.getElementById('history-list');
-    list.innerHTML = '';
-    if (snap.empty) {
-      list.innerHTML = '<p class="empty">No past batches found.</p>';
-      return;
-    }
+  // ── Render a single batch item ──
+  function renderBatchItem(doc) {
+    const b = doc.data();
+    const date = b.createdAt ? b.createdAt.toDate().toLocaleDateString() : 'Unknown';
+    const catInfo = b.expenseCategories
+      ? `${b.expenseCategories.length} custom categories`
+      : (b.auditCycle || 'Default categories');
+    const item = document.createElement('div');
+    item.className = 'history-item';
 
-    snap.forEach(doc => {
-      const b = doc.data();
-      const date = b.createdAt ? b.createdAt.toDate().toLocaleDateString() : 'Unknown';
-      const catInfo = b.expenseCategories
-        ? `${b.expenseCategories.length} custom categories`
-        : (b.auditCycle || 'Default categories');
-      const item = document.createElement('div');
-      item.className = 'history-item';
+    // XSS-safe: Use textContent for user-controlled fields instead of innerHTML
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'info';
+    const nameEl = document.createElement('strong');
+    nameEl.textContent = b.clientName || 'Unnamed';
+    const detailEl = document.createElement('span');
+    const receiptCount = b.uploadedCount || b.receiptCount || 0;
+    detailEl.innerHTML = `${escapeHtml(catInfo)} &bull; ${escapeHtml(date)} &bull; <b>${receiptCount} receipts</b>`;
+    infoDiv.appendChild(nameEl);
+    infoDiv.appendChild(detailEl);
 
-      // XSS-safe: Use textContent for user-controlled fields instead of innerHTML
-      const infoDiv = document.createElement('div');
-      infoDiv.className = 'info';
-      const nameEl = document.createElement('strong');
-      nameEl.textContent = b.clientName || 'Unnamed';
-      const detailEl = document.createElement('span');
-      const receiptCount = b.uploadedCount || b.receiptCount || 0;
-      detailEl.innerHTML = `${escapeHtml(catInfo)} &bull; ${escapeHtml(date)} &bull; <b>${receiptCount} receipts</b>`;
-      infoDiv.appendChild(nameEl);
-      infoDiv.appendChild(detailEl);
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'actions';
+    actionsDiv.innerHTML = `
+        <button class="btn-restore">Restore</button>
+        <button class="btn-batch-del" title="Delete Batch" style="color: var(--danger); margin-left: 8px;">
+            <span class="material-symbols-rounded">delete</span>
+        </button>
+    `;
 
-      const actionsDiv = document.createElement('div');
-      actionsDiv.className = 'actions';
-      actionsDiv.innerHTML = `
-          <button class="btn-restore">Restore</button>
-          <button class="btn-batch-del" title="Delete Batch" style="color: var(--danger); margin-left: 8px;">
-              <span class="material-symbols-rounded">delete</span>
-          </button>
-      `;
+    item.appendChild(infoDiv);
+    item.appendChild(actionsDiv);
+    item.querySelector('.btn-restore').onclick = () => {
+      if (!confirm('Restore this batch?')) return;
+      showLoader('Restoring session...');
+      state.setClientName(b.clientName);
+      state.setBatchId(doc.id);
+      saveSession(b.status || 'active');
+      // Ensure we load with #camera so ensureAuth triggers restoration
+      window.location.href = '#camera';
+      window.location.reload();
+    };
+    item.querySelector('.btn-batch-del').onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Permanently delete batch "${b.clientName || 'Batch'}" and all its images? This cannot be undone.`)) return;
 
-      item.appendChild(infoDiv);
-      item.appendChild(actionsDiv);
-      item.querySelector('.btn-restore').onclick = () => {
-        if (!confirm('Restore this batch?')) return;
-        showLoader('Restoring session...');
-        state.setClientName(b.clientName);
-        state.setBatchId(doc.id);
-        saveSession(b.status || 'active');
-        // Ensure we load with #camera so ensureAuth triggers restoration
-        window.location.href = '#camera';
-        window.location.reload();
-      };
-      item.querySelector('.btn-batch-del').onclick = async (e) => {
-        e.stopPropagation();
-        if (!confirm(`Permanently delete batch "${b.clientName || 'Batch'}" and all its images? This cannot be undone.`)) return;
+      // Optimistic UI removal
+      item.remove();
 
-        // Optimistic UI removal
-        item.remove();
+      try {
+        const batchRef = db.collection('batches').doc(doc.id);
+        const receiptsSnap = await batchRef.collection('receipts').get();
 
-        try {
-          const batchRef = db.collection('batches').doc(doc.id);
-          const receiptsSnap = await batchRef.collection('receipts').get();
+        const batch = db.batch();
 
-          const batch = db.batch();
+        // 1. Delete Images from Storage (Parallel)
+        const deletionPromises = [];
+        receiptsSnap.forEach(r => {
+          const data = r.data();
+          if (data.storagePath) {
+            const imageRef = storage.ref(data.storagePath);
+            deletionPromises.push(imageRef.delete().catch(err => {
+              console.warn(`Failed to delete image ${data.storagePath}:`, err);
+              // Continue even if one fails
+            }));
+          }
+          // 2. Queue Firestore Deletion
+          batch.delete(r.ref);
+        });
 
-          // 1. Delete Images from Storage (Parallel)
-          const deletionPromises = [];
-          receiptsSnap.forEach(r => {
-            const data = r.data();
-            if (data.storagePath) {
-              const imageRef = storage.ref(data.storagePath);
-              deletionPromises.push(imageRef.delete().catch(err => {
-                console.warn(`Failed to delete image ${data.storagePath}:`, err);
-                // Continue even if one fails
-              }));
-            }
-            // 2. Queue Firestore Deletion
-            batch.delete(r.ref);
-          });
+        // Wait for all storage deletions
+        await Promise.all(deletionPromises);
 
-          // Wait for all storage deletions
-          await Promise.all(deletionPromises);
+        // 3. Commit Firestore Deletion
+        batch.delete(batchRef);
+        await batch.commit();
 
-          // 3. Commit Firestore Deletion
-          batch.delete(batchRef);
-          await batch.commit();
-
-          showToast('Batch and images deleted', 'success');
-        } catch (err) {
-          console.error(err);
-          showToast('Failed to delete batch', 'error');
-          // Restore item if failed (simplified, just reload list)
-          showHistory();
-        }
-      };
-      list.appendChild(item);
-    });
-
-  } catch (e) {
-    document.getElementById('history-list').innerHTML = `<p class="error">${e.message}</p>`;
+        showToast('Batch and images deleted', 'success');
+      } catch (err) {
+        console.error(err);
+        showToast('Failed to delete batch', 'error');
+      }
+    };
+    return item;
   }
+
+  // ── Load a page of batches ──
+  async function loadPage() {
+    if (isLoading) return;
+    isLoading = true;
+
+    // Remove existing "Load More" button if present
+    const existingBtn = list.querySelector('.btn-load-more');
+    if (existingBtn) existingBtn.remove();
+
+    try {
+      let query = db.collection('batches')
+        .where('ownerId', '==', state.currentUser.uid)
+        .orderBy('createdAt', 'desc')
+        .limit(PAGE_SIZE);
+
+      // Cursor: start after the last document from the previous page
+      if (lastDoc) {
+        query = query.startAfter(lastDoc);
+      }
+
+      const snap = await query.get();
+
+      // First page: clear the loading indicator
+      if (!lastDoc) {
+        list.innerHTML = '';
+        if (snap.empty) {
+          list.innerHTML = '<p class="empty">No past batches found.</p>';
+          return;
+        }
+      }
+
+      // Render each batch item
+      snap.forEach(doc => {
+        list.appendChild(renderBatchItem(doc));
+      });
+
+      // Save the cursor for the next page
+      lastDoc = snap.docs[snap.docs.length - 1];
+
+      // Show "Load More" if we got a full page (more may exist)
+      if (snap.size === PAGE_SIZE) {
+        const loadMoreBtn = document.createElement('button');
+        loadMoreBtn.className = 'btn-load-more';
+        loadMoreBtn.textContent = 'Load More';
+        loadMoreBtn.onclick = () => loadPage();
+        list.appendChild(loadMoreBtn);
+      }
+
+    } catch (e) {
+      const errEl = document.createElement('p');
+      errEl.className = 'error';
+      errEl.textContent = e.message;
+      list.appendChild(errEl);
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  // Load the first page
+  await loadPage();
 }
 
 // ────────────────────────────────────────────────────────
@@ -694,6 +747,12 @@ function startExtractionListener() {
           // Derive status strictly: prioritize "extracted" boolean
           const effectiveStatus = data.extracted ? 'extracted' : (data.status || 'synced');
           updateThumbnailStatus(id, effectiveStatus, data);
+
+          // Re-evaluate Export button (processing cards may have just finished)
+          if (DOM.btnExport) {
+            const stillProcessing = document.querySelectorAll('.is-processing').length;
+            DOM.btnExport.disabled = (batchState.totalCount === 0 || batchState.pendingCount > 0 || stillProcessing > 0);
+          }
         }
       });
     }, err => {
@@ -705,58 +764,7 @@ function startExtractionListener() {
 const cameraObserver = new MutationObserver(() => {
   if (DOM.camera.classList.contains('active')) {
     startExtractionListener();
-    startAutoRetryCheck();
-  } else {
-    stopAutoRetryCheck();
+    // Retry logic is handled solely by watchdog.js (unified system)
   }
 });
 cameraObserver.observe(DOM.camera, { attributes: true, attributeFilter: ['class'] });
-
-let autoRetryInterval = null;
-function startAutoRetryCheck() {
-  if (autoRetryInterval) return;
-  autoRetryInterval = setInterval(() => checkAndTriggerRetries(), 10000);
-}
-
-async function checkAndTriggerRetries() {
-  if (!state.batchId) return;
-
-  const cards = document.querySelectorAll('.is-processing');
-  const now = Date.now();
-
-  for (const card of cards) {
-    const data = card._firestoreData;
-    if (!data) continue;
-
-    const isStuckState = data.status === 'synced' || data.status === 'uploaded' || data.status === 'processing' || data.status === 'error';
-    if (!isStuckState || data.extracted === true) continue;
-
-    const uploadedTime = data.uploadedAt ? (typeof data.uploadedAt.toMillis === 'function' ? data.uploadedAt.toMillis() : data.uploadedAt) : (data.createdAt || now);
-    const diffMs = now - uploadedTime;
-
-    // Retry after 20s stuck (reduced from 60s for speed)
-    if (diffMs > 20000 && data.status !== 'pending_retry') {
-      const id = card.id.replace('q-', '');
-      console.log(`[Auto-Retry] Triggering for ${id} (Stuck for ${Math.round(diffMs / 1000)}s)`);
-
-      try {
-        data.status = 'pending_retry';
-        await db.collection('batches').doc(state.batchId)
-          .collection('receipts').doc(id).update({
-            status: 'pending_retry',
-            autoRetryCount: firebase.firestore.FieldValue.increment(1),
-            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-          });
-      } catch (err) {
-        console.warn(`[Auto-Retry] Failed for ${id}:`, err);
-      }
-    }
-  }
-}
-
-function stopAutoRetryCheck() {
-  if (autoRetryInterval) {
-    clearInterval(autoRetryInterval);
-    autoRetryInterval = null;
-  }
-}

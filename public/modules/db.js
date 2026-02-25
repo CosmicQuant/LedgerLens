@@ -1,4 +1,4 @@
-import { openPreview, showToast, updateFinishButton, updateThumbnailStatus } from './ui.js';
+import { openPreview, showToast, updateThumbnailStatus } from './ui.js';
 
 const IDB_NAME = 'ledgerlens-db';
 const IDB_VERSION = 3;
@@ -9,14 +9,14 @@ let idbInstance = null;
 export async function getIDB() {
     if (idbInstance) return idbInstance;
     idbInstance = await idb.openDB(IDB_NAME, IDB_VERSION, {
-        upgrade(database, oldVersion) {
+        upgrade(database, oldVersion, newVersion, transaction) {
             let store;
             if (oldVersion < 1) {
                 store = database.createObjectStore(STORE_NAME, { keyPath: 'id' });
                 store.createIndex('status', 'status');
                 store.createIndex('batchId', 'batchId');
             } else {
-                store = database.transaction.objectStore(STORE_NAME);
+                store = transaction.objectStore(STORE_NAME);
             }
 
             if (oldVersion < 2) {
@@ -113,4 +113,24 @@ export async function getBatchCounts(batchId) {
         totalInIDB,
         pendingCount: queuedCount + pendingCount + uploadingCount
     };
+}
+
+/** Clear all IDB items for a specific batch (Zombie cleanup) */
+export async function clearIDBForBatch(batchId) {
+    try {
+        const database = await getIDB();
+        const tx = database.transaction(STORE_NAME, 'readwrite');
+        const store = tx.store;
+        const index = store.index('batchId');
+        let cursor = await index.openCursor(IDBKeyRange.only(batchId));
+
+        while (cursor) {
+            await cursor.delete();
+            cursor = await cursor.continue();
+        }
+        await tx.done;
+        console.log(`[DB] Cleared IDB zombies for batch ${batchId}`);
+    } catch (e) {
+        console.warn('[DB] Failed to clear IDB for batch:', e);
+    }
 }

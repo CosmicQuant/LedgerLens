@@ -21,7 +21,6 @@ export const DOM = {
     btnSnap: document.querySelector('.btn-shutter'),
     btnGallery: document.getElementById('btn-gallery'),
     queueList: document.querySelector('.queue-list'),
-    btnFinish: document.getElementById('btn-finish'),
     btnExport: document.getElementById('btn-export'),
     toastBox: document.getElementById('toast-container'),
     modal: document.querySelector('.modal-overlay'),
@@ -161,11 +160,7 @@ export function showToast(msg, type = 'info', duration = 3000) {
     }, duration);
 }
 
-export function updateFinishButton(totalCount, pendingCount) {
-    if (DOM.btnFinish) {
-        DOM.btnFinish.disabled = (totalCount === 0 || pendingCount > 0);
-    }
-}
+
 
 /**
  * Update the usage meter display and color zone.
@@ -221,15 +216,7 @@ export function updateUsageMeter({ totalCount, syncedCount, pendingCount, limit,
     }
 }
 
-export function setBatchCompleted(isCompleted) {
-    if (isCompleted) {
-        if (DOM.btnFinish) DOM.btnFinish.style.display = 'none';
-        if (DOM.btnExport) DOM.btnExport.style.display = 'flex';
-    } else {
-        if (DOM.btnFinish) DOM.btnFinish.style.display = 'flex';
-        if (DOM.btnExport) DOM.btnExport.style.display = 'none';
-    }
-}
+
 
 export function addThumbnailToQueue(id, thumbUrl, status, firestoreData, onDelete) {
     return new Promise((resolve) => {

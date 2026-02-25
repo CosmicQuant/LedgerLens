@@ -1116,7 +1116,6 @@ body {
   -webkit-backdrop-filter: blur(8px);
 }
 
-.btn-finish,
 .btn-export {
   flex: 1;
   padding: 14px 16px;
@@ -1131,28 +1130,17 @@ body {
   max-width: 400px;
   border: none;
   cursor: pointer;
-}
-
-.btn-finish {
-  background: linear-gradient(135deg, var(--success), #20c997);
-  color: #0d0f1a;
-}
-
-.btn-finish:disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-}
-
-.btn-finish:not(:disabled):active {
-  transform: scale(0.97);
-}
-
-.btn-export {
   background: linear-gradient(135deg, var(--ai-sparkle), #7c3aed);
   color: #fff;
 }
 
-.btn-export:active {
+.btn-export:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  filter: grayscale(0.5);
+}
+
+.btn-export:not(:disabled):active {
   transform: scale(0.97);
 }
 
@@ -1849,4 +1837,28 @@ body {
   color: var(--text-secondary);
   opacity: 0.7;
   line-height: 1.4;
+}
+
+/* ═══════════════════════════════════════════════════════
+   LOAD MORE BUTTON (History Pagination)
+   ═══════════════════════════════════════════════════════ */
+.btn-load-more {
+  display: block;
+  width: 100%;
+  padding: 12px;
+  margin-top: 12px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-load-more:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }

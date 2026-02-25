@@ -20,7 +20,6 @@ import {
     DOM,
     showToast,
     updateThumbnailStatus,
-    updateFinishButton,
     addThumbnailToQueue
 } from './ui.js';
 import { batchState } from './batch-state.js';
@@ -134,42 +133,90 @@ export class PipelineController {
         showToast(`Vaulting ${validFiles.length} images...`, 'info');
         batchState.notifyBulkAdd(validFiles.length);
 
-        // 3. UI OPTIMIZATION
-        const queueItems = validFiles.map(file => {
-            const id = uid();
-            return {
-                id,
-                file: file,
-                receipt: {
-                    id,  // FIX: Set id synchronously — NOT in requestAnimationFrame
-                    batchId: state.batchId,
-                    name: file.name || `gallery_${Date.now()}.jpg`,
-                    size: file.size,
-                    status: 'queued',
-                    createdAt: Date.now(),
-                    mimeType: file.type || 'image/jpeg'
-                }
-            };
-        });
+        // ──────────────────────────────────────────────────
+        // INTERLEAVED PIPELINE: READ → VAULT → RELEASE
+        // Android gallery gives temporary content:// URIs that expire
+        // after ~30-60s. We read files in micro-batches of 10, immediately
+        // vault-save them to IDB, then release references before reading
+        // the next batch. This keeps peak RAM at ~40MB (10 × 4MB) regardless
+        // of total batch size, while still beating the URI timer.
+        // ──────────────────────────────────────────────────
+        const MICRO_BATCH = 10;
+        let capturedCount = 0;
+        let failedCount = 0;
 
-        // 4. RENDER UI IN BACKGROUND
-        requestAnimationFrame(() => {
-            queueItems.forEach(item => {
+        for (let i = 0; i < validFiles.length; i += MICRO_BATCH) {
+            const batch = validFiles.slice(i, i + MICRO_BATCH);
+
+            // STEP 1: Fast-read this micro-batch into persistent Blobs
+            const readResults = await Promise.allSettled(
+                batch.map(async (file) => {
+                    try {
+                        const ab = await file.arrayBuffer();
+                        return {
+                            blob: new Blob([ab], { type: file.type || 'image/jpeg' }),
+                            name: file.name || `gallery_${Date.now()}.jpg`,
+                            type: file.type || 'image/jpeg'
+                        };
+                    } catch (e) {
+                        console.warn(`[Pipeline] Read failed for ${file.name}:`, e.name);
+                        return null;
+                    }
+                })
+            );
+
+            // STEP 2: Build queue items + render ghost cards for this micro-batch
+            const batchItems = [];
+            for (const result of readResults) {
+                const data = result.status === 'fulfilled' ? result.value : null;
+                if (!data) { failedCount++; continue; }
+
+                const id = uid();
+                batchItems.push({
+                    id,
+                    blob: data.blob,
+                    receipt: {
+                        id,
+                        batchId: state.batchId,
+                        name: data.name,
+                        size: data.blob.size,
+                        status: 'queued',
+                        createdAt: Date.now(),
+                        mimeType: data.type
+                    }
+                });
+            }
+
+            // Render ghost cards for this micro-batch
+            for (const item of batchItems) {
                 addThumbnailToQueue(item.id, null, 'ghost', null, this.onDelete);
-            });
-        });
+            }
 
-        // 5. PARALLEL VAULTING (The "Chunker")
-        // Mobile: 2 parallel to halve peak RAM (~8MB vs ~20MB on budget Android)
-        const CHUNK_SIZE = IS_MOBILE ? 2 : 5;
-        for (let i = 0; i < queueItems.length; i += CHUNK_SIZE) {
-            const chunk = queueItems.slice(i, i + CHUNK_SIZE);
+            // STEP 3: Vault-save this micro-batch to IDB (5 at a time)
+            const VAULT_CHUNK = 5;
+            for (let v = 0; v < batchItems.length; v += VAULT_CHUNK) {
+                const vaultChunk = batchItems.slice(v, v + VAULT_CHUNK);
+                await Promise.all(vaultChunk.map(item =>
+                    this._saveToVault(item.id, item.blob, item.receipt)
+                ));
+            }
 
-            // Pass both the item ID, the RAW OS file, and the receipt metadata
-            await Promise.all(chunk.map(item => this._saveToVault(item.id, item.file, item.receipt)));
+            capturedCount += batchItems.length;
+            // References to this micro-batch's Blobs are now released
+            // (only IDB holds them). GC can reclaim the ~40MB.
         }
 
-        // 6. KICKSTART CONVEYOR
+        if (capturedCount === 0) {
+            showToast('Failed to read files. Please try again.', 'error');
+            return;
+        }
+        if (failedCount > 0) {
+            showToast(`${failedCount} files expired before read. ${capturedCount} will be processed.`, 'warning');
+        }
+
+        console.log(`[Pipeline] Interleaved vault complete: ${capturedCount}/${validFiles.length} files`);
+
+        // KICKSTART CONVEYOR
         this.processConveyorBelt();
     }
 
@@ -185,15 +232,10 @@ export class PipelineController {
         try {
             let receiptToSave;
 
-            try {
-                // Primary path: Convert to ArrayBuffer for maximum IDB compatibility
-                const arrayBuffer = await file.arrayBuffer();
-                receiptToSave = { ...receiptBase, id, buffer: arrayBuffer };
-            } catch (abErr) {
-                // FIX: DOMException fallback (Vivo Y03 / budget Android)
-                console.warn(`[Pipeline] arrayBuffer() failed for ${id}, using Blob fallback:`, abErr.name);
-                receiptToSave = { ...receiptBase, id, blob: file };
-            }
+            // FIX: DO NOT use arrayBuffer()! It streams to RAM and causes 
+            // `NotReadableError` on Android gallery bulk uploads due to timeouts.
+            // IDB natively supports storing `File` and `Blob` safely.
+            receiptToSave = { ...receiptBase, id, blob: file };
 
             // DIRECT WRITE TO IDB
             await saveReceiptToIDB(receiptToSave);
