@@ -117,13 +117,17 @@ export function showNotification(title, msg, type = 'info', actions = []) {
             <div class="notification-icon ${type}">
                 <span class="material-symbols-rounded">${icons[type] || 'info'}</span>
             </div>
-            <h3 class="notification-title">${title}</h3>
-            <p class="notification-message">${msg}</p>
+            <h3 class="notification-title"></h3>
+            <p class="notification-message"></p>
             <div class="notification-actions">
                 ${btnsHtml}
             </div>
         </div>
     `;
+
+    // XSS-safe: set user-controlled content via textContent
+    overlay.querySelector('.notification-title').textContent = title;
+    overlay.querySelector('.notification-message').textContent = msg;
 
     document.body.appendChild(overlay);
 

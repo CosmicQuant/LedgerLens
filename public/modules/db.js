@@ -99,14 +99,18 @@ export async function getBatchCounts(batchId) {
     const store = tx.store;
     const index = store.index('batchId_status');
 
-    const [localCount, pendingCount, uploadingCount] = await Promise.all([
-        store.index('batchId').count(batchId),
+    // Count ALL items for this batch (regardless of status)
+    const totalInIDB = await store.index('batchId').count(batchId);
+
+    // Count items still processing (for breakdown display)
+    const [queuedCount, pendingCount, uploadingCount] = await Promise.all([
+        index.count(IDBKeyRange.only([batchId, 'queued'])),
         index.count(IDBKeyRange.only([batchId, 'pending_upload'])),
         index.count(IDBKeyRange.only([batchId, 'uploading']))
     ]);
 
     return {
-        localCount,
-        pendingCount: pendingCount + uploadingCount
+        totalInIDB,
+        pendingCount: queuedCount + pendingCount + uploadingCount
     };
 }

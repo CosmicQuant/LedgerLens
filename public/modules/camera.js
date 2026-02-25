@@ -1,13 +1,12 @@
 import { state } from './state.js';
 import { showToast } from './ui.js';
+import { acquireWakeLock, releaseWakeLock } from './wakelock.js';
 
 const MAX_WIDTH = 1500;
 const THUMB_WIDTH = 150;
 const COMPRESS_QUALITY = 0.8;
 
-// Reusable canvases
-const captureCanvas = document.createElement('canvas');
-const captureCtx = captureCanvas.getContext('2d');
+// Reusable canvas for thumbnails only (low-risk, small size)
 const thumbCanvas = document.createElement('canvas');
 const thumbCtx = thumbCanvas.getContext('2d');
 
@@ -41,27 +40,6 @@ export function getFileExtension() {
 
 // ── Wake Lock ────────────────────────────────────────────
 let isTorchOn = false;
-let wakeLock = null;
-
-async function requestWakeLock() {
-    try {
-        if ('wakeLock' in navigator) {
-            wakeLock = await navigator.wakeLock.request('screen');
-            wakeLock.addEventListener('release', () => { wakeLock = null; });
-            console.log('[WakeLock] Acquired');
-        }
-    } catch (e) {
-        console.warn('[WakeLock] Failed:', e.message);
-    }
-}
-
-function releaseWakeLock() {
-    if (wakeLock) {
-        wakeLock.release();
-        wakeLock = null;
-        console.log('[WakeLock] Released');
-    }
-}
 
 // ── Camera Control ───────────────────────────────────────
 
@@ -106,7 +84,7 @@ export async function startCamera(videoElement, torchButton) {
         }
 
         // Prevent phone sleep
-        await requestWakeLock();
+        await acquireWakeLock('camera');
     } catch (err) {
         showToast('Camera access denied', 'error');
         console.error('Camera error:', err);
@@ -119,11 +97,13 @@ export function stopCamera(videoElement) {
         state.mediaStream = null;
         if (videoElement) videoElement.srcObject = null;
     }
-    releaseWakeLock();
+    releaseWakeLock('camera');
 }
 
 // ── Frame Capture ────────────────────────────────────────
-// Pure Shutter: Captures raw pixels, hands over to Pipeline.
+// Pure Shutter: Captures raw pixels with pre-downscale, hands over to Pipeline.
+// FIX: Uses an independent canvas per capture to prevent race conditions
+// on rapid shutter taps (shared canvas caused DOMException on Vivo Y03).
 export async function captureFrame(videoElement) {
     if (!state.mediaStream) return null;
 
@@ -131,43 +111,40 @@ export async function captureFrame(videoElement) {
         // Shutter: Capture instantaneous bitmap
         const bitmap = await createImageBitmap(videoElement);
 
-        // Convert to blob so it can be handled by the Pipeline logic (Gatekeeper + Slicing)
-        // We use a helper canvas for this conversion
-        captureCanvas.width = videoElement.videoWidth;
-        captureCanvas.height = videoElement.videoHeight;
-        captureCtx.drawImage(bitmap, 0, 0);
+        // Pre-downscale to MAX_WIDTH to reduce blob size and RAM pressure.
+        // A 1920×1080 frame at full quality = ~2MB blob + 8MB pixel buffer.
+        // At 1500px wide = ~500KB blob + 4MB pixel buffer — 50% RAM savings.
+        const srcW = bitmap.width;
+        const srcH = bitmap.height;
+        let targetW = srcW;
+        let targetH = srcH;
+        if (srcW > MAX_WIDTH) {
+            const scale = MAX_WIDTH / srcW;
+            targetW = MAX_WIDTH;
+            targetH = Math.round(srcH * scale);
+        }
+
+        // FIX: Create a NEW canvas per capture instead of reusing a singleton.
+        // This prevents the race condition where rapid taps overwrite the
+        // shared canvas while toBlob() is still encoding the previous frame.
+        const canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0, targetW, targetH);
         bitmap.close();
 
         return new Promise(resolve => {
-            captureCanvas.toBlob(blob => {
+            canvas.toBlob(blob => {
                 if (blob) blob.name = `capture_${Date.now()}.jpg`;
                 resolve(blob);
-            }, 'image/jpeg', 0.95); // High quality for raw capture
+                // Canvas is now garbage-collectible (no reference held)
+            }, 'image/jpeg', COMPRESS_QUALITY);
         });
     } catch (err) {
         console.error("[Camera] Shutter failed:", err);
         return null;
     }
-}
-
-async function captureFrameFallback(videoElement) {
-    const track = state.mediaStream.getVideoTracks()[0];
-    const settings = track.getSettings();
-
-    const videoWidth = videoElement.videoWidth || settings.width || 1280;
-    const videoHeight = videoElement.videoHeight || settings.height || 720;
-
-    const targetW = MAX_WIDTH;
-    const scale = targetW / videoWidth;
-    const targetH = videoHeight * scale;
-
-    captureCanvas.width = targetW;
-    captureCanvas.height = targetH;
-    captureCtx.drawImage(videoElement, 0, 0, targetW, targetH);
-
-    return new Promise(resolve => {
-        captureCanvas.toBlob(blob => resolve(blob), getPreferredMime(), COMPRESS_QUALITY);
-    });
 }
 
 // ── Thumbnail Generation ─────────────────────────────────
@@ -217,19 +194,23 @@ export async function generateThumbnail(source, isVideo = true) {
 export function blobToImage(blob) {
     return new Promise((resolve, reject) => {
         const img = new Image();
+        const url = URL.createObjectURL(blob);
         const timeout = setTimeout(() => {
+            URL.revokeObjectURL(url);
             img.src = '';
             reject(new Error('Image load timeout (10s)'));
         }, 10000);
 
         img.onload = () => {
             clearTimeout(timeout);
+            URL.revokeObjectURL(url);
             resolve(img);
         };
         img.onerror = (err) => {
             clearTimeout(timeout);
+            URL.revokeObjectURL(url);
             reject(err);
         };
-        img.src = URL.createObjectURL(blob);
+        img.src = url;
     });
 }

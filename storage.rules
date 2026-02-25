@@ -3,15 +3,17 @@ service firebase.storage {
   match /b/{bucket}/o {
 
     // ════════════════════════════════════════════════════
-    // Receipt Images: /receipts/{batchId}/{fileName}
+    // Receipt Images: /receipts/{userId}/{batchId}/{fileName}
+    // Security: Only the owning user can read/write/delete their receipts
     // ════════════════════════════════════════════════════
-    match /receipts/{batchId}/{fileName} {
+    match /receipts/{userId}/{batchId}/{fileName} {
 
-      // READ: Authenticated users only
-      allow read: if request.auth != null;
+      // READ: Only the owner
+      allow read: if request.auth != null && request.auth.uid == userId;
 
-      // CREATE/UPDATE: Authenticated + validation
+      // CREATE/UPDATE: Owner only + validation
       allow create, update: if request.auth != null
+                   && request.auth.uid == userId
                    // Max 5 MB per image
                    && request.resource.size < 5 * 1024 * 1024
                    // Only image MIME types
@@ -19,8 +21,8 @@ service firebase.storage {
                    // Must have a file extension
                    && fileName.matches('.*\\.(jpg|jpeg|png|webp)');
       
-      // DELETE: Authenticated users only
-      allow delete: if request.auth != null;
+      // DELETE: Only the owner
+      allow delete: if request.auth != null && request.auth.uid == userId;
     }
 
     // ════════════════════════════════════════════════════

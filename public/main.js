@@ -4,7 +4,7 @@ import { startCamera, stopCamera, captureFrame } from './modules/camera.js';
 import { getIDB, saveReceiptToIDB, deleteReceiptFromIDB } from './modules/db.js';
 import { DOM, showScreen, showToast, addThumbnailToQueue, updateFinishButton, updateThumbnailStatus, setBatchCompleted, updateUsageMeter, showLoader, hideLoader, showNotification } from './modules/ui.js';
 import { uploader } from './modules/uploader.js';
-import { uid, sanitizeInput } from './modules/utils.js';
+import { uid, sanitizeInput, escapeHtml } from './modules/utils.js';
 import { batchState } from './modules/batch-state.js';
 import { startWatchdog, stopWatchdog } from './modules/watchdog.js';
 
@@ -245,9 +245,19 @@ DOM.formSetup.addEventListener('submit', async (e) => {
 
 const MAX_GALLERY_UPLOAD = 100;
 
-// Snap Button
+// Snap Button (with debounce to prevent DOMException from rapid taps)
+let _shutterBusy = false;
 if (DOM.btnSnap) {
   DOM.btnSnap.onclick = async () => {
+    // Debounce: prevent overlapping captures on rapid taps
+    if (_shutterBusy) return;
+    _shutterBusy = true;
+    DOM.btnSnap.classList.add('disabled');
+    setTimeout(() => {
+      _shutterBusy = false;
+      DOM.btnSnap.classList.remove('disabled');
+    }, 800);
+
     if (batchState.isAtLimit) {
       showToast('Batch Limit Reached. Please Finish this batch.', 'error');
       return;
@@ -564,18 +574,29 @@ async function showHistory() {
         : (b.auditCycle || 'Default categories');
       const item = document.createElement('div');
       item.className = 'history-item';
-      item.innerHTML = `
-                <div class="info">
-                    <strong>${b.clientName || 'Unnamed'}</strong>
-                    <span>${catInfo} &bull; ${date} &bull; <b>${b.uploadedCount || b.receiptCount || 0} receipts</b></span>
-                </div>
-                <div class="actions">
-                    <button class="btn-restore">Restore</button>
-                    <button class="btn-batch-del" title="Delete Batch" style="color: var(--danger); margin-left: 8px;">
-                        <span class="material-symbols-rounded">delete</span>
-                    </button>
-                </div>
-            `;
+
+      // XSS-safe: Use textContent for user-controlled fields instead of innerHTML
+      const infoDiv = document.createElement('div');
+      infoDiv.className = 'info';
+      const nameEl = document.createElement('strong');
+      nameEl.textContent = b.clientName || 'Unnamed';
+      const detailEl = document.createElement('span');
+      const receiptCount = b.uploadedCount || b.receiptCount || 0;
+      detailEl.innerHTML = `${escapeHtml(catInfo)} &bull; ${escapeHtml(date)} &bull; <b>${receiptCount} receipts</b>`;
+      infoDiv.appendChild(nameEl);
+      infoDiv.appendChild(detailEl);
+
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'actions';
+      actionsDiv.innerHTML = `
+          <button class="btn-restore">Restore</button>
+          <button class="btn-batch-del" title="Delete Batch" style="color: var(--danger); margin-left: 8px;">
+              <span class="material-symbols-rounded">delete</span>
+          </button>
+      `;
+
+      item.appendChild(infoDiv);
+      item.appendChild(actionsDiv);
       item.querySelector('.btn-restore').onclick = () => {
         if (!confirm('Restore this batch?')) return;
         showLoader('Restoring session...');

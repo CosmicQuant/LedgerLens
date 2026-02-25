@@ -24,8 +24,8 @@ import {
     addThumbnailToQueue
 } from './ui.js';
 import { batchState } from './batch-state.js';
-import { getFileExtension, blobToImage, generateThumbnail } from './camera.js';
 import { uid } from './utils.js';
+import { acquireWakeLock, releaseWakeLock, reacquireIfNeeded } from './wakelock.js';
 
 // Configuration constants
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -89,18 +89,26 @@ export class PipelineController {
 
         console.log(`[Pipeline] Analyzing ${files.length} files...`);
 
-        // PILLAR 8: Pre-batch Auth Token Refresh
-        // 1. WAKE LOCK IMMEDIATELY
-        if ('wakeLock' in navigator && !this.wakeLock) {
-            this.requestWakeLock();
-        }
+        // WAKE LOCK IMMEDIATELY
+        acquireWakeLock('pipeline');
 
-        // 2. FAST FILTER (Pure JS, no Async)
+        // FAST FILTER (Pure JS, no Async)
         const validFiles = [];
+        let heicSkipped = 0;
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             // Skip non-images
             if (!file.type.startsWith('image/')) continue;
+
+            // HEIC Detection: iPhones default to HEIC format.
+            // createImageBitmap() fails on HEIC in Chrome/Firefox,
+            // and Storage rules reject image/heic MIME type.
+            const name = (file.name || '').toLowerCase();
+            if (file.type === 'image/heic' || file.type === 'image/heif' ||
+                name.endsWith('.heic') || name.endsWith('.heif')) {
+                heicSkipped++;
+                continue;
+            }
 
             // Check duplicates
             const fingerprint = `${file.name}-${file.size}-${file.lastModified}`;
@@ -111,8 +119,16 @@ export class PipelineController {
         }
 
         if (validFiles.length === 0) {
-            showToast('No new files to add.', 'info');
+            if (heicSkipped > 0) {
+                showToast(`${heicSkipped} HEIC file(s) skipped. Please use JPEG/PNG format or change iPhone camera settings (Settings → Camera → Formats → Most Compatible).`, 'warning');
+            } else {
+                showToast('No new files to add.', 'info');
+            }
             return;
+        }
+
+        if (heicSkipped > 0) {
+            showToast(`${heicSkipped} HEIC file(s) skipped (unsupported format).`, 'warning');
         }
 
         showToast(`Vaulting ${validFiles.length} images...`, 'info');
@@ -120,17 +136,18 @@ export class PipelineController {
 
         // 3. UI OPTIMIZATION
         const queueItems = validFiles.map(file => {
+            const id = uid();
             return {
-                id: uid(),
-                file: file, // We pass the file down, but DON'T put it in the receipt yet
+                id,
+                file: file,
                 receipt: {
+                    id,  // FIX: Set id synchronously — NOT in requestAnimationFrame
                     batchId: state.batchId,
                     name: file.name || `gallery_${Date.now()}.jpg`,
                     size: file.size,
                     status: 'queued',
                     createdAt: Date.now(),
                     mimeType: file.type || 'image/jpeg'
-                    // NOTE: 'blob: file' has been completely removed from here!
                 }
             };
         });
@@ -138,13 +155,13 @@ export class PipelineController {
         // 4. RENDER UI IN BACKGROUND
         requestAnimationFrame(() => {
             queueItems.forEach(item => {
-                item.receipt.id = item.id;
                 addThumbnailToQueue(item.id, null, 'ghost', null, this.onDelete);
             });
         });
 
         // 5. PARALLEL VAULTING (The "Chunker")
-        const CHUNK_SIZE = 5;
+        // Mobile: 2 parallel to halve peak RAM (~8MB vs ~20MB on budget Android)
+        const CHUNK_SIZE = IS_MOBILE ? 2 : 5;
         for (let i = 0; i < queueItems.length; i += CHUNK_SIZE) {
             const chunk = queueItems.slice(i, i + CHUNK_SIZE);
 
@@ -166,33 +183,78 @@ export class PipelineController {
         }
 
         try {
-            // 1. Convert the OS File pointer into raw binary data (ArrayBuffer)
-            // This is lightning fast, avoids VRAM crashes, and permanently beats the Android security timer!
-            const arrayBuffer = await file.arrayBuffer();
+            let receiptToSave;
 
-            // 2. Attach the pure binary buffer to the receipt
-            const receiptToSave = {
-                ...receiptBase,
-                buffer: arrayBuffer
-            };
+            try {
+                // Primary path: Convert to ArrayBuffer for maximum IDB compatibility
+                const arrayBuffer = await file.arrayBuffer();
+                receiptToSave = { ...receiptBase, id, buffer: arrayBuffer };
+            } catch (abErr) {
+                // FIX: DOMException fallback (Vivo Y03 / budget Android)
+                console.warn(`[Pipeline] arrayBuffer() failed for ${id}, using Blob fallback:`, abErr.name);
+                receiptToSave = { ...receiptBase, id, blob: file };
+            }
 
-            // 3. DIRECT WRITE TO IDB
+            // DIRECT WRITE TO IDB
             await saveReceiptToIDB(receiptToSave);
 
-            // 4. Push to processing queue
+            // Push to processing queue
             this.jobQueue.push({ id });
 
-            // 5. Update UI from "Ghost" to "Placeholder"
-            const card = document.getElementById(`q-${id}`);
-            if (card) {
-                card.classList.remove('is-ghost');
-                card.classList.add('is-placeholder');
-            }
+            // IMMEDIATE THUMBNAIL: Generate a tiny 80px preview on the main thread.
+            // This gives users instant visual feedback instead of grey ghost cards
+            // while waiting 20-60s for the full Worker compression pipeline.
+            // The Worker will replace this with a better thumbnail later.
+            this._generateQuickThumbnail(id, file);
 
         } catch (err) {
             console.error(`[Pipeline] Vault Save Failed ${id}`, err);
             updateThumbnailStatus(id, 'error');
         }
+    }
+
+    /**
+     * Generate an 80px thumbnail on the main thread for instant UI feedback.
+     * Non-blocking: failures are silent (Worker will retry later).
+     */
+    _generateQuickThumbnail(id, fileOrBlob) {
+        // Fire-and-forget: don't block the vault pipeline
+        createImageBitmap(fileOrBlob).then(bitmap => {
+            const THUMB_SIZE = 80;
+            let tw = bitmap.width;
+            let th = bitmap.height;
+            if (tw > th && tw > THUMB_SIZE) {
+                th = Math.round(th * THUMB_SIZE / tw);
+                tw = THUMB_SIZE;
+            } else if (th > THUMB_SIZE) {
+                tw = Math.round(tw * THUMB_SIZE / th);
+                th = THUMB_SIZE;
+            }
+
+            const c = document.createElement('canvas');
+            c.width = tw;
+            c.height = th;
+            const ctx = c.getContext('2d');
+            ctx.drawImage(bitmap, 0, 0, tw, th);
+            bitmap.close();
+
+            c.toBlob(thumbBlob => {
+                if (!thumbBlob) return;
+                const thumbUrl = URL.createObjectURL(thumbBlob);
+
+                const card = document.getElementById(`q-${id}`);
+                if (!card) return;
+                const img = card.querySelector('img');
+                if (img) {
+                    img.src = thumbUrl;
+                    card.classList.remove('is-ghost', 'is-placeholder');
+                    const icon = card.querySelector('.placeholder-icon');
+                    if (icon) icon.remove();
+                }
+            }, 'image/jpeg', 0.4);
+        }).catch(() => {
+            // Silent: Worker pipeline will handle thumbnail generation
+        });
     }
 
     // ==========================================
@@ -204,40 +266,21 @@ export class PipelineController {
                 console.warn(`[Pipeline] App backgrounded with ${this.activeJobs} active jobs & ${this.jobQueue.length} queued.`);
             } else if (document.visibilityState === 'visible') {
                 console.log('[Pipeline] App foregrounded.');
-                if (this.wakeLock === null && this.activeJobs > 0) {
-                    this.requestWakeLock();
+                if (this.activeJobs > 0) {
+                    reacquireIfNeeded();
                 }
             }
         });
     }
 
-    async requestWakeLock() {
-        if (!('wakeLock' in navigator)) return;
-        try {
-            if (!this.wakeLock) {
-                this.wakeLock = await navigator.wakeLock.request('screen');
-                console.log('[Pipeline] Wake Lock acquired 🕯️');
-            }
-        } catch (err) {
-            console.warn('[Pipeline] Wake Lock failed:', err);
-        }
-    }
 
-    releaseWakeLock() {
-        if (this.wakeLock) {
-            this.wakeLock.release().then(() => {
-                this.wakeLock = null;
-                console.log('[Pipeline] Wake Lock released 💤');
-            });
-        }
-    }
 
     // ==========================================
     // STAGE 2: THE CONVEYOR BELT (Strict Concurrency)
     // ==========================================
     processConveyorBelt() {
         if (this.activeJobs > 0) {
-            this.requestWakeLock();
+            acquireWakeLock('pipeline');
         }
 
         while (this.activeJobs < this.MAX_ACTIVE_JOBS && this.jobQueue.length > 0) {
@@ -255,7 +298,7 @@ export class PipelineController {
                 this.activeJobs--;
 
                 if (this.activeJobs === 0 && this.jobQueue.length === 0) {
-                    this.releaseWakeLock();
+                    releaseWakeLock('pipeline');
 
                     // V39 STRICT BATCH COMPLETION WIPE:
                     const inputBulk = document.getElementById('input-bulk');
@@ -269,115 +312,99 @@ export class PipelineController {
 
 
 
-    processFullJobPipeline({ id }) {
-        return new Promise(async (resolve) => {
-            let displayUrl = null;
-            let pristineFile = null;
-            let fileToUpload = null;
-            let storedReceipt = null;
+    async processFullJobPipeline({ id }) {
+        let pristineFile = null;
+        let fileToUpload = null;
+        let storedReceipt = null;
 
-            try {
-                // 1. ADD GHOST CARD IMMEDIATELY (Redundant safety)
-                await addThumbnailToQueue(id, null, 'uploading', null, this.onDelete);
+        try {
+            // 1. ADD GHOST CARD IMMEDIATELY (Redundant safety)
+            await addThumbnailToQueue(id, null, 'uploading', null, this.onDelete);
 
-                // We are GUARANTEED that the data exists because IDB spooler pushed us here.
-                storedReceipt = await getReceiptFromIDB(id);
+            // We are GUARANTEED that the data exists because IDB spooler pushed us here.
+            storedReceipt = await getReceiptFromIDB(id);
 
-                if (storedReceipt && storedReceipt.buffer) {
-                    // V60: Reconstruct the Blob from the raw ArrayBuffer exactly at the moment of upload
-                    pristineFile = new Blob([storedReceipt.buffer], { type: storedReceipt.mimeType || 'image/jpeg' });
-                } else if (storedReceipt && storedReceipt.blob) {
-                    pristineFile = typeof storedReceipt.blob === 'string'
-                        ? await (await fetch(storedReceipt.blob)).blob()
-                        : storedReceipt.blob;
-                } else if (storedReceipt && storedReceipt.base64Fallback) {
+            if (storedReceipt && storedReceipt.buffer) {
+                // Reconstruct the Blob from the raw ArrayBuffer
+                pristineFile = new Blob([storedReceipt.buffer], { type: storedReceipt.mimeType || 'image/jpeg' });
+            } else if (storedReceipt && storedReceipt.blob) {
+                // DOMException fallback path: Blob was stored directly
+                pristineFile = typeof storedReceipt.blob === 'string'
+                    ? await (await fetch(storedReceipt.blob)).blob()
+                    : storedReceipt.blob;
+            } else if (storedReceipt && storedReceipt.base64Fallback) {
+                const response = await fetch(storedReceipt.base64Fallback);
+                pristineFile = await response.blob();
+            } else {
+                throw new Error(`Missing IDB Byte stream for job ${id}.`);
+            }
+
+            fileToUpload = pristineFile;
+
+            // 2. STRICT SEQUENTIAL DECODE & COMPRESS LOCK
+            await new Promise((lockResolve) => {
+                this.decodeQueue = this.decodeQueue.then(async () => {
                     try {
-                        const response = await fetch(storedReceipt.base64Fallback);
-                        pristineFile = await response.blob();
-                    } catch (fetchErr) {
-                        throw new Error(`Failed to read Base64 fallback for ${id} - string corrupted.`);
-                    }
-                } else if (storedReceipt && storedReceipt.pinUrl) {
-                    // Legacy code path in case of weird old cache hits
-                    try {
-                        const response = await fetch(storedReceipt.pinUrl);
-                        pristineFile = await response.blob();
-                    } catch (fetchErr) {
-                        throw new Error(`Failed to read pinned ObjectURL for ${id} - OS may have destroyed it.`);
-                    }
-                } else {
-                    throw new Error(`Missing IDB Byte stream and no fallback pin for job ${id}.`);
-                }
+                        updateThumbnailStatus(id, 'compressing');
+                        const safeClone = pristineFile.slice(0, pristineFile.size, pristineFile.type);
+                        const workerResult = await this.compressWithTolerantFallback(safeClone);
 
-                fileToUpload = pristineFile;
-
-                // 2. STRICT SEQUENTIAL DECODE & COMPRESS LOCK
-                await new Promise((lockResolve) => {
-                    this.decodeQueue = this.decodeQueue.then(async () => {
-                        try {
-                            updateThumbnailStatus(id, 'compressing');
-                            // NOTE: Since we compressed in the Spooler, this step is fast now!
-                            const safeClone = pristineFile.slice(0, pristineFile.size, pristineFile.type);
-                            const workerResult = await this.compressWithTolerantFallback(safeClone);
-
-                            if (workerResult && workerResult.blob) {
-                                fileToUpload = workerResult.blob;
-                                // Inject thumbnail directly from worker!
-                                if (workerResult.thumbnailUrl) {
-                                    const imgElement = document.querySelector(`#q-${id} .thumbnail-img`) || document.querySelector(`#q-${id} img`);
-                                    if (imgElement) {
-                                        imgElement.src = workerResult.thumbnailUrl;
-                                        const card = document.getElementById(`q-${id}`);
-                                        if (card) {
-                                            card.classList.remove('is-placeholder', 'is-ghost');
-                                            imgElement.parentElement.classList.remove('is-placeholder');
-                                            const icon = imgElement.parentElement.querySelector('.placeholder-icon');
-                                            if (icon) icon.remove();
-                                        }
+                        if (workerResult && workerResult.blob) {
+                            fileToUpload = workerResult.blob;
+                            // Inject thumbnail directly from worker!
+                            if (workerResult.thumbnailUrl) {
+                                const imgElement = document.querySelector(`#q-${id} .thumbnail-img`) || document.querySelector(`#q-${id} img`);
+                                if (imgElement) {
+                                    imgElement.src = workerResult.thumbnailUrl;
+                                    const card = document.getElementById(`q-${id}`);
+                                    if (card) {
+                                        card.classList.remove('is-placeholder', 'is-ghost');
+                                        imgElement.parentElement.classList.remove('is-placeholder');
+                                        const icon = imgElement.parentElement.querySelector('.placeholder-icon');
+                                        if (icon) icon.remove();
                                     }
                                 }
-                            } else {
-                                fileToUpload = workerResult; // Fallback if worker array was empty
                             }
-
-                        } catch (compressionError) {
-                            console.warn(`[Pipeline] Compression/Decode failed for ${id}, using raw file:`, compressionError);
-                            fileToUpload = pristineFile;
+                        } else {
+                            fileToUpload = workerResult; // Fallback if worker array was empty
                         }
 
-                        lockResolve();
-                    }).catch(err => {
-                        console.error('[Pipeline] Global decoder lock error:', err);
-                        lockResolve();
-                    });
+                    } catch (compressionError) {
+                        console.warn(`[Pipeline] Compression/Decode failed for ${id}, using raw file:`, compressionError);
+                        fileToUpload = pristineFile;
+                    }
+
+                    lockResolve();
+                }).catch(err => {
+                    console.error('[Pipeline] Global decoder lock error:', err);
+                    lockResolve();
                 });
+            });
 
-                // 3. Persistence Update (IDB)
-                storedReceipt.status = 'uploading';
-                storedReceipt.size = fileToUpload.size;
-                await saveReceiptToIDB(storedReceipt);
-                batchState.notifyGhostMaterialized(1);
+            // 3. Persistence Update (IDB)
+            storedReceipt.status = 'uploading';
+            storedReceipt.size = fileToUpload.size;
+            await saveReceiptToIDB(storedReceipt);
+            batchState.notifyGhostMaterialized(1);
 
-                // 4. FIREBASE UPLOAD
-                await this.uploadWithResumable(id, fileToUpload, pristineFile);
+            // 4. FIREBASE UPLOAD
+            await this.uploadWithResumable(id, fileToUpload, pristineFile);
 
-            } catch (fatalError) {
-                console.error(`[Pipeline] Fatal error processing ${id}:`, fatalError ? fatalError.message : 'Unknown', fatalError ? fatalError.stack : '');
-                updateThumbnailStatus(id, 'error');
-                batchState.notifyGhostMaterialized(1);
-            } finally {
-                // 5. IRONCLAD GARBAGE COLLECTION
-                if (storedReceipt && storedReceipt.pinUrl) {
-                    URL.revokeObjectURL(storedReceipt.pinUrl);
-                }
-
-                state.activeObjectURLs.delete(id);
-                this.uploadTasks.delete(id);
-
-                console.log(`[Pipeline] Slot Freed for job: ${id}`);
-                resolve();
+        } catch (fatalError) {
+            console.error(`[Pipeline] Fatal error processing ${id}:`, fatalError ? fatalError.message : 'Unknown', fatalError ? fatalError.stack : '');
+            updateThumbnailStatus(id, 'error');
+            batchState.notifyGhostMaterialized(1);
+        } finally {
+            // IRONCLAD GARBAGE COLLECTION
+            if (storedReceipt && storedReceipt.pinUrl) {
+                URL.revokeObjectURL(storedReceipt.pinUrl);
             }
-        });
+
+            state.activeObjectURLs.delete(id);
+            this.uploadTasks.delete(id);
+
+            console.log(`[Pipeline] Slot Freed for job: ${id}`);
+        }
     }
 
     cancelJob(id) {
@@ -397,13 +424,77 @@ export class PipelineController {
     }
 
     async compressWithTolerantFallback(blob) {
-        if (this.workerPool.length === 0) return blob;
+        // If Worker pool exists (OffscreenCanvas supported), use it
+        if (this.workerPool.length > 0) {
+            const currentIdx = this.workerRR;
+            this.workerRR = (this.workerRR + 1) % this.workerPool.length;
+            return await this.runWorkerTask(currentIdx, blob);
+        }
 
-        const currentIdx = this.workerRR;
-        this.workerRR = (this.workerRR + 1) % this.workerPool.length;
+        // FALLBACK: Main-thread canvas compression for browsers without OffscreenCanvas
+        // (Safari < 16.4, some Firefox Android builds)
+        // Without this, raw 4-8MB photos upload uncompressed, burning Storage quota 4×.
+        console.warn('[Pipeline] No OffscreenCanvas — using main-thread compression fallback');
+        return await this._compressOnMainThread(blob);
+    }
 
-        // Send to worker
-        return await this.runWorkerTask(currentIdx, blob);
+    /**
+     * Main-thread canvas compression fallback.
+     * Used when OffscreenCanvas is unavailable (Safari < 16.4, Firefox Android).
+     * Resizes to 1500px wide + generates a base64 thumbnail.
+     */
+    async _compressOnMainThread(blob) {
+        const MAX_W = 1500;
+        const THUMB_MAX = 100;
+
+        const bitmap = await createImageBitmap(blob);
+        let targetW = bitmap.width;
+        let targetH = bitmap.height;
+        if (targetW > MAX_W) {
+            const scale = MAX_W / targetW;
+            targetW = MAX_W;
+            targetH = Math.round(bitmap.height * scale);
+        }
+
+        // Compress
+        const canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+
+        const compressedBlob = await new Promise(resolve => {
+            canvas.toBlob(b => resolve(b), 'image/jpeg', 0.8);
+        });
+
+        // Thumbnail
+        let tw = bitmap.width;
+        let th = bitmap.height;
+        if (tw > th && tw > THUMB_MAX) {
+            th = Math.round(th * THUMB_MAX / tw);
+            tw = THUMB_MAX;
+        } else if (th > THUMB_MAX) {
+            tw = Math.round(tw * THUMB_MAX / th);
+            th = THUMB_MAX;
+        }
+
+        const tCanvas = document.createElement('canvas');
+        tCanvas.width = tw;
+        tCanvas.height = th;
+        tCanvas.getContext('2d').drawImage(bitmap, 0, 0, tw, th);
+        bitmap.close();
+
+        const tBlob = await new Promise(resolve => {
+            tCanvas.toBlob(b => resolve(b), 'image/jpeg', 0.4);
+        });
+
+        const thumbnailUrl = await new Promise(resolve => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.readAsDataURL(tBlob);
+        });
+
+        return { blob: compressedBlob, thumbnailUrl };
     }
 
     runWorkerTask(workerIdx, data) {
@@ -452,82 +543,82 @@ export class PipelineController {
             else if (ext === 'png') mimeType = 'image/png';
         }
 
-        const storagePath = `receipts/${state.batchId}/${id}.${ext}`;
+        // Security: Include user UID in storage path to enforce ownership in rules
+        const userId = state.currentUser ? state.currentUser.uid : 'anonymous';
+        const storagePath = `receipts/${userId}/${state.batchId}/${id}.${ext}`;
         const sRef = storage.ref(storagePath);
 
-        return new Promise(async (resolve, reject) => {
-            // PRE-FLIGHT CHECK
-            try {
-                await blob.slice(0, 1).arrayBuffer();
-            } catch (e) {
-                console.error(`[Pipeline] Dead OS File descriptor for ${id}.`);
+        // PRE-FLIGHT CHECK
+        try {
+            await blob.slice(0, 1).arrayBuffer();
+        } catch (e) {
+            console.error(`[Pipeline] Dead OS File descriptor for ${id}.`);
+            updateThumbnailStatus(id, 'error');
+            throw new Error('File descriptor closed by mobile OS. Tap to retry.');
+        }
+
+        const task = sRef.put(blob, { contentType: mimeType });
+        this.uploadTasks.set(id, task);
+
+        // PROGRESS-BASED TIMEOUT: Kill only if no progress for 30s (not total elapsed)
+        // On African 3G networks, a 4MB upload can take 160s total but still be progressing.
+        let lastProgressTime = Date.now();
+        let killSwitchTimer = setInterval(() => {
+            if (Date.now() - lastProgressTime > 30000) {
+                console.error(`[Pipeline] No-progress timeout triggered for ${id}.`);
+                clearInterval(killSwitchTimer);
+                if (this.uploadTasks.has(id)) {
+                    task.cancel();
+                }
                 updateThumbnailStatus(id, 'error');
-                return reject(new Error('File descriptor closed by mobile OS. Tap to retry.'));
             }
+        }, 5000);
 
-            const task = sRef.put(blob, { contentType: mimeType });
-            this.uploadTasks.set(id, task);
-
-            // 30-SECOND KILL SWITCH
-            let killSwitchTimer;
-            const timeoutPromise = new Promise((_, timeoutReject) => {
-                killSwitchTimer = setTimeout(() => {
-                    console.error(`[Pipeline] 30-Second Kill Switch Triggered for ${id}.`);
-                    if (this.uploadTasks.has(id)) {
-                        task.cancel();
-                    }
+        return new Promise((resolve, reject) => {
+            task.on('state_changed',
+                (snapshot) => {
+                    lastProgressTime = Date.now(); // Reset timeout on any progress
+                    const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+                    updateThumbnailStatus(id, 'uploading', null, progress);
+                },
+                (error) => {
+                    clearInterval(killSwitchTimer);
+                    console.error(`[Pipeline] Upload task failed for ${id}:`, error ? error.message : '', error);
                     updateThumbnailStatus(id, 'error');
-                    timeoutReject(new Error('Network Upload Timeout'));
-                }, 30000);
-            });
-
-            const firebaseUploadPromise = new Promise((firebaseResolve, firebaseReject) => {
-                task.on('state_changed',
-                    (snapshot) => {
-                        const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-                        updateThumbnailStatus(id, 'uploading', null, progress);
-                    },
-                    (error) => {
-                        console.error(`[Pipeline] Upload task failed for ${id}:`, error ? error.message : '', error);
-                        updateThumbnailStatus(id, 'error');
-                        firebaseReject(error);
-                    },
-                    async () => {
-                        if (task.snapshot.state === 'canceled') {
-                            return firebaseReject(new Error('Task Canceled'));
-                        }
-
-                        try {
-                            const downloadUrl = await task.snapshot.ref.getDownloadURL();
-
-                            if (!downloadUrl) {
-                                throw new Error("Upload failed: No URL returned");
-                            }
-
-                            await firestore.collection('batches').doc(state.batchId).collection('receipts').doc(id).set({
-                                storageUrl: downloadUrl, storagePath, file_path: storagePath, file_extension: ext,
-                                status: 'synced', extracted: false, uploadedAt: window.firebase.firestore.FieldValue.serverTimestamp()
-                            });
-
-                            await deleteReceiptFromIDB(id);
-                            batchState.notifyUploadComplete();
-                            updateThumbnailStatus(id, 'synced');
-                            firebaseResolve();
-                        } catch (e) {
-                            firebaseReject(e);
-                        }
+                    reject(error);
+                },
+                async () => {
+                    clearInterval(killSwitchTimer);
+                    if (task.snapshot.state === 'canceled') {
+                        return reject(new Error('Task Canceled'));
                     }
-                );
-            });
 
-            try {
-                await Promise.race([firebaseUploadPromise, timeoutPromise]);
-                resolve();
-            } catch (raceError) {
-                reject(raceError);
-            } finally {
-                clearTimeout(killSwitchTimer);
-            }
+                    try {
+                        const downloadUrl = await task.snapshot.ref.getDownloadURL();
+
+                        if (!downloadUrl) {
+                            throw new Error("Upload failed: No URL returned");
+                        }
+
+                        await firestore.collection('batches').doc(state.batchId).collection('receipts').doc(id).set({
+                            storageUrl: downloadUrl, storagePath, file_path: storagePath, file_extension: ext,
+                            status: 'synced', extracted: false, uploadedAt: window.firebase.firestore.FieldValue.serverTimestamp()
+                        });
+
+                        // Increment cloud count on the batch doc
+                        await firestore.collection('batches').doc(state.batchId).update({
+                            uploadedCount: window.firebase.firestore.FieldValue.increment(1)
+                        });
+
+                        await deleteReceiptFromIDB(id);
+                        batchState.notifyUploadComplete();
+                        updateThumbnailStatus(id, 'synced');
+                        resolve();
+                    } catch (e) {
+                        reject(e);
+                    }
+                }
+            );
         });
     }
 }

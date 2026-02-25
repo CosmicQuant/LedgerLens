@@ -1,29 +1,30 @@
 /**
  * BatchStateManager — Single Source of Truth for batch counters.
  *
- * Instead of scattering snapCounter++ across handlers, this module
- * provides real counts from IDB + Firestore, a pub-sub for UI,
- * and usage-meter color zone logic.
+ * Architecture: ALWAYS RECALCULATE from real sources (IDB + Firestore).
+ * No manual increments/decrements. No optimistic math. No ghost counts.
+ * Every notify method just triggers a debounced recalculate.
  */
 
-import { getIDB, getBatchCounts } from './db.js';
+import { getBatchCounts } from './db.js';
 import { state } from './state.js';
 
 const BATCH_LIMIT = 100;
-const ZONE_WARNING = 90;  // Orange at 90+
+const ZONE_WARNING = 90;
+const RECALC_DEBOUNCE_MS = 150; // Batch rapid events into one IDB query
 
 class BatchStateManager {
     constructor() {
         this._batchId = '';
         this._firestore = null;
-        this.localCount = 0;
-        this.cloudCount = 0;
-        this.pendingCount = 0;
-        this.totalCount = 0;
-        this.ghostCount = 0; // Tracks items in memory before IDB save
+        this.localCount = 0;   // Items in IDB (all statuses)
+        this.cloudCount = 0;   // Items in Firestore (uploaded)
+        this.pendingCount = 0; // Items in IDB still processing
+        this.totalCount = 0;   // localCount + cloudCount
 
         this.subscribers = new Set();
         this._recalculating = false;
+        this._debounceTimer = null;
     }
 
     /** Bind to the current batch + Firestore instance */
@@ -34,76 +35,58 @@ class BatchStateManager {
         this.cloudCount = 0;
         this.totalCount = 0;
         this.pendingCount = 0;
-        this.ghostCount = 0;
     }
 
-    /** Register a callback: fn({ totalCount, localCount, cloudCount, pendingCount, limit, zone }) */
+    /** Register a callback */
     subscribe(fn) {
         this.subscribers.add(fn);
-        return () => {
-            this.subscribers.delete(fn);
-        };
+        return () => this.subscribers.delete(fn);
     }
 
     /** Derive the color zone */
     get zone() {
-        if (this.totalCount >= BATCH_LIMIT) return 'limit';     // Red
-        if (this.totalCount >= ZONE_WARNING) return 'warning';   // Orange
-        return 'normal';                                          // Default
+        if (this.totalCount >= BATCH_LIMIT) return 'limit';
+        if (this.totalCount >= ZONE_WARNING) return 'warning';
+        return 'normal';
     }
 
     get limit() { return BATCH_LIMIT; }
-
     get isAtLimit() { return this.totalCount >= BATCH_LIMIT; }
-
     get canAdd() { return this.totalCount < BATCH_LIMIT; }
-
-    /** How many more can be added */
     get remaining() { return Math.max(0, BATCH_LIMIT - this.totalCount); }
 
     /**
-     * Recalculate counts from real sources (IDB + Firestore).
-     * This is the ONLY place counters are set.
+     * Recalculate counts from the ONLY two real sources:
+     *   1. IDB — items waiting to upload
+     *   2. Firestore batch doc — uploadedCount (items already in cloud)
+     * This is the ONLY place counters are set. No manual math anywhere.
      */
     async recalculate() {
         if (this._recalculating || !this._batchId) return;
         this._recalculating = true;
 
         try {
-            // 1. Get counts from IDB (Pending/Local)
+            // 1. IDB: Count all items for this batch
             const stats = await getBatchCounts(this._batchId);
-            this.localCount = stats.localCount; // Keep localCount for now, though pendingCount is more detailed
+            this.localCount = stats.totalInIDB;
+            this.pendingCount = stats.pendingCount;
 
-            // 2. Get authoritative cloud count from Firestore
+            // 2. Firestore: Get authoritative cloud count
             if (this._firestore && state.currentUser) {
                 try {
                     const snap = await this._firestore
                         .collection('batches').doc(this._batchId).get();
                     if (snap.exists) {
                         const data = snap.data();
-                        // Use uploadedCount as the authoritative synced number
-                        this.cloudCount = data.uploadedCount || data.receiptCount || 0;
+                        this.cloudCount = data.uploadedCount || 0;
                     }
                 } catch (e) {
                     console.warn('[BatchState] Firestore count failed:', e.message);
                 }
             }
 
-            // STABLE TOTAL LOGIC
-            // To prevent UI jitter where a file is counted as both "Ghost" and "Pending"
-            // during the split-second IDB handoff, we ensure pending drops back when ghost decreases.
-            this.pendingCount = stats.pendingCount + Math.max(0, this.ghostCount);
-            const newTotal = this.cloudCount + this.pendingCount;
-
-            // Strict assignment prevents runaway counts
-            this.totalCount = newTotal;
-            // We "hold" the totalCount if it's within a small margin of error (2 items)
-            // or if it's an increase (new items added).
-            // This logic is now redundant with the direct assignment above, but kept for historical context if needed.
-            // The direct assignment `this.totalCount = newTotal;` is the primary update.
-            // if (newTotal >= this.totalCount || (this.totalCount - newTotal) > 2) {
-            //     this.totalCount = newTotal;
-            // }
+            // TOTAL = items in IDB + items in cloud
+            this.totalCount = this.localCount + this.cloudCount;
 
             this._notify();
         } finally {
@@ -112,42 +95,46 @@ class BatchStateManager {
     }
 
     /**
-     * Notify that a large batch of files was added (Gallery Bulk)
+     * Debounced recalculate — batches rapid events (e.g., 10 vault saves
+     * in 100ms) into a single IDB + Firestore query.
      */
+    _debouncedRecalculate() {
+        if (this._debounceTimer) clearTimeout(this._debounceTimer);
+        this._debounceTimer = setTimeout(() => {
+            this._debounceTimer = null;
+            this.recalculate();
+        }, RECALC_DEBOUNCE_MS);
+    }
+
+    // ═══════════════════════════════════════════
+    // Event Notifications: All just trigger recalculate
+    // ═══════════════════════════════════════════
+
+    /** Gallery/camera bulk add — just recalculate */
     notifyBulkAdd(count) {
         if (!this._batchId) return;
-        this.ghostCount += count;
-        this.recalculate();
+        this._debouncedRecalculate();
     }
 
+    /** A ghost item saved to IDB — just recalculate */
     notifyGhostMaterialized(count = 1) {
         if (!this._batchId) return;
-        this.ghostCount = Math.max(0, this.ghostCount - count);
-        this.recalculate();
+        this._debouncedRecalculate();
     }
 
+    /** Legacy: single item change */
     notifyChange() {
-        this.totalCount++;
-        this.localCount++;
-        this.pendingCount++;
-        this._notify();
-        this.recalculate();
+        this._debouncedRecalculate();
     }
 
+    /** Item deleted — recalculate */
     notifyDelete() {
-        this.totalCount = Math.max(0, this.totalCount - 1);
-        this.localCount = Math.max(0, this.localCount - 1);
-        this.pendingCount = Math.max(0, this.pendingCount - 1);
-        this._notify();
-        this.recalculate();
+        this._debouncedRecalculate();
     }
 
+    /** Upload completed — recalculate to sync with Firestore */
     notifyUploadComplete() {
-        // Just move the internal markers
-        this.pendingCount = Math.max(0, this.pendingCount - 1);
-        this.cloudCount++;
-        // Keep totalCount stable
-        this._notify();
+        this._debouncedRecalculate();
     }
 
     /** Broadcast current state to all subscribers */
@@ -175,8 +162,8 @@ class BatchStateManager {
         this.cloudCount = 0;
         this.pendingCount = 0;
         this.totalCount = 0;
-        this.ghostCount = 0;
         this._batchId = '';
+        if (this._debounceTimer) clearTimeout(this._debounceTimer);
         this._notify();
     }
 }
