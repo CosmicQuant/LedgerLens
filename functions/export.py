@@ -82,27 +82,12 @@ def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
     receipt_docs = receipts_ref.order_by("uploadedAt").stream()
 
     rows = []
-    bucket = storage.bucket()
 
     for doc in receipt_docs:
         data = doc.to_dict()
         ext = data.get("extractedData", {})
-        storage_path = data.get("storagePath", "")
-
-        # Build permanent link for the receipt image
-        image_link = ""
-        if storage_path:
-            try:
-                blob = bucket.blob(storage_path)
-                token = ensure_storage_token(blob)
-                image_link = get_permanent_download_url(
-                    bucket.name, storage_path, token
-                )
-            except Exception as e:
-                print(f"[Warn] Could not get URL for {storage_path}: {e}")
 
         rows.append({
-            "Receipt ID":      doc.id,
             "Date":            ext.get("date", ""),
             "Vendor":          ext.get("vendor", ""),
             "Total":           ext.get("total", 0),
@@ -111,7 +96,6 @@ def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
             "Invoice #":       ext.get("invoice_number", ""),
             "Confidence":      ext.get("confidence_score", 0),
             "Duplicate":       ext.get("flag_duplicate", False),
-            "Image Link":      image_link,
         })
 
     if not rows:
@@ -190,20 +174,12 @@ def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
             "num_format": "#,##0.00",
             "valign": "vcenter",
         })
-        fmt_link = workbook.add_format({
-            "font_size": 10,
-            "font_name": "Calibri",
-            "font_color": "#0066cc",
-            "underline": True,
-            "border": 1,
-            "border_color": "#d0d0d0",
-            "valign": "vcenter",
-        })
+
 
         # ── Title rows ──────────────────────────────────
-        worksheet.merge_range("A1:J1", f"LedgerLens Audit Report — {client_name}", fmt_title)
+        worksheet.merge_range("A1:H1", f"LedgerLens Audit Report — {client_name}", fmt_title)
         worksheet.merge_range(
-            "A2:J2",
+            "A2:H2",
             f"Cycle: {audit_cycle}  |  Batch: {batch_id}  |  Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
             fmt_subtitle,
         )
@@ -230,11 +206,6 @@ def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
 
                 if col_name in ("Total", "Tax"):
                     worksheet.write_number(excel_row, col_idx, float(value or 0), money_fmt)
-                elif col_name == "Image Link" and value:
-                    worksheet.write_url(
-                        excel_row, col_idx, str(value),
-                        fmt_link, string="View Receipt"
-                    )
                 elif col_name == "Duplicate":
                     worksheet.write(excel_row, col_idx, "YES" if value else "No", cell_fmt)
                 elif col_name == "Confidence":
@@ -243,7 +214,7 @@ def generate_excel_report(batch_id: str, db) -> tuple[bytes, str]:
                     worksheet.write(excel_row, col_idx, str(value) if value else "", cell_fmt)
 
         # ── Column widths ───────────────────────────────
-        col_widths = [14, 12, 22, 12, 10, 16, 14, 12, 10, 16]
+        col_widths = [12, 22, 12, 10, 16, 14, 12, 10]
         for i, w in enumerate(col_widths):
             worksheet.set_column(i, i, w)
 
@@ -351,8 +322,8 @@ def export_batch(req: https_fn.Request) -> https_fn.Response:
         # Generate the Excel report
         excel_bytes, filename = generate_excel_report(batch_id, db)
 
-        # Upload to Firebase Storage
-        export_path = f"exports/{batch_id}/{filename}"
+        # Upload to Firebase Storage (userId-scoped for security)
+        export_path = f"exports/{caller_uid}/{batch_id}/{filename}"
         bucket = storage.bucket()
         blob = bucket.blob(export_path)
         

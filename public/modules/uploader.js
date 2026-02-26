@@ -19,6 +19,7 @@ import {
 import {
     DOM,
     showToast,
+    showNotification,
     updateThumbnailStatus,
     addThumbnailToQueue
 } from './ui.js';
@@ -28,6 +29,7 @@ import { acquireWakeLock, releaseWakeLock, reacquireIfNeeded } from './wakelock.
 
 // Configuration constants
 const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+const GALLERY_SELECTION_LIMIT = 30;  // Max files per gallery pick (RAM + URI safety)
 
 export class PipelineController {
     constructor() {
@@ -37,6 +39,7 @@ export class PipelineController {
         // --- 2. Live Queues & State ---
         this.jobQueue = [];
         this.activeJobs = 0;
+        this.conveyorPaused = false; // Freeze conveyor during gallery reads
         this.fingerprints = new Set(); // Prevent duplicate files
         this.uploadTasks = new Map(); // Track active tasks for cancellation
         this.wakeLock = null; // Prevent mobile sleep during batches
@@ -109,8 +112,11 @@ export class PipelineController {
                 continue;
             }
 
-            // Check duplicates
-            const fingerprint = `${file.name}-${file.size}-${file.lastModified}`;
+            // Check duplicates — camera blobs have no name/lastModified,
+            // so use size + current timestamp to avoid false dedup
+            const fingerprint = file.name && file.lastModified
+                ? `${file.name}-${file.size}-${file.lastModified}`
+                : `capture-${file.size}-${Date.now()}-${Math.random()}`;
             if (this.fingerprints.has(fingerprint)) continue;
 
             this.fingerprints.add(fingerprint);
@@ -119,7 +125,8 @@ export class PipelineController {
 
         if (validFiles.length === 0) {
             if (heicSkipped > 0) {
-                showToast(`${heicSkipped} HEIC file(s) skipped. Please use JPEG/PNG format or change iPhone camera settings (Settings → Camera → Formats → Most Compatible).`, 'warning');
+                // Non-blocking: don't halt pipeline for HEIC info
+                showNotification('Unsupported Format', `${heicSkipped} HEIC file(s) skipped. Please use JPEG/PNG format or change iPhone camera settings (Settings → Camera → Formats → Most Compatible).`, 'warning');
             } else {
                 showToast('No new files to add.', 'info');
             }
@@ -127,52 +134,95 @@ export class PipelineController {
         }
 
         if (heicSkipped > 0) {
-            showToast(`${heicSkipped} HEIC file(s) skipped (unsupported format).`, 'warning');
+            // Fire-and-forget: don't await — let pipeline continue
+            showNotification('Heads Up', `${heicSkipped} HEIC file(s) skipped (unsupported format). The rest will be processed.`, 'warning');
+        }
+
+        // GATE: Reject selections larger than 30 files
+        // 30 × 4MB = 120MB peak RAM (safe on all phones)
+        // 30 files read in <1s (safe from Android URI expiry)
+        if (validFiles.length > GALLERY_SELECTION_LIMIT) {
+            showNotification('Too Many Files', `Please select up to ${GALLERY_SELECTION_LIMIT} images at a time. You selected ${validFiles.length}. You can attach more after this batch.`, 'warning');
+            // Clear fingerprints so user can re-select
+            for (const file of validFiles) {
+                const fp = file.name && file.lastModified
+                    ? `${file.name}-${file.size}-${file.lastModified}` : null;
+                if (fp) this.fingerprints.delete(fp);
+            }
+            return;
         }
 
         showToast(`Vaulting ${validFiles.length} images...`, 'info');
         batchState.notifyBulkAdd(validFiles.length);
 
         // ──────────────────────────────────────────────────
-        // INTERLEAVED PIPELINE: READ → VAULT → RELEASE
+        // PHASE 1: SEQUENTIAL SPEED-READ (CONVEYOR PAUSED)
         // Android gallery gives temporary content:// URIs that expire
-        // after ~30-60s. We read files in micro-batches of 10, immediately
-        // vault-save them to IDB, then release references before reading
-        // the next batch. This keeps peak RAM at ~40MB (10 × 4MB) regardless
-        // of total batch size, while still beating the URI timer.
+        // after ~10-30s on some devices (Samsung, Vivo, etc.).
+        // Sequential reads (~30-50ms each) avoid I/O contention that
+        // causes later files to fail when the conveyor is also busy.
+        //
+        // The conveyor is paused during reads to give the content
+        // provider full I/O bandwidth. Pause is ~1-2 seconds total.
         // ──────────────────────────────────────────────────
-        const MICRO_BATCH = 10;
-        let capturedCount = 0;
-        let failedCount = 0;
+        this.conveyorPaused = true;
+        const readBlobs = [];
 
-        for (let i = 0; i < validFiles.length; i += MICRO_BATCH) {
-            const batch = validFiles.slice(i, i + MICRO_BATCH);
+        console.log(`[Pipeline] Phase 1: Sequential read of ${validFiles.length} files (conveyor paused)...`);
+        const readStart = Date.now();
 
-            // STEP 1: Fast-read this micro-batch into persistent Blobs
-            const readResults = await Promise.allSettled(
-                batch.map(async (file) => {
-                    try {
-                        const ab = await file.arrayBuffer();
-                        return {
-                            blob: new Blob([ab], { type: file.type || 'image/jpeg' }),
-                            name: file.name || `gallery_${Date.now()}.jpg`,
-                            type: file.type || 'image/jpeg'
-                        };
-                    } catch (e) {
-                        console.warn(`[Pipeline] Read failed for ${file.name}:`, e.name);
-                        return null;
-                    }
-                })
-            );
+        for (let i = 0; i < validFiles.length; i++) {
+            const file = validFiles[i];
+            try {
+                const ab = await file.arrayBuffer();
+                readBlobs.push({
+                    blob: new Blob([ab], { type: file.type || 'image/jpeg' }),
+                    name: file.name || `gallery_${Date.now()}.jpg`,
+                    type: file.type || 'image/jpeg'
+                });
+            } catch (e) {
+                console.warn(`[Pipeline] Read failed for ${file.name || 'capture'}:`, e.name);
+                readBlobs.push(null);
+            }
+        }
 
-            // STEP 2: Build queue items + render ghost cards for this micro-batch
-            const batchItems = [];
-            for (const result of readResults) {
-                const data = result.status === 'fulfilled' ? result.value : null;
-                if (!data) { failedCount++; continue; }
+        // Resume conveyor immediately
+        this.conveyorPaused = false;
 
+        const capturedCount = readBlobs.filter(Boolean).length;
+        const failedCount = readBlobs.length - capturedCount;
+        console.log(`[Pipeline] Phase 1 done: ${capturedCount}/${validFiles.length} captured in ${Date.now() - readStart}ms`);
+
+        if (capturedCount === 0) {
+            showNotification('Read Failed', 'Failed to read files. Please try again.', 'error');
+            return;
+        }
+        if (failedCount > 0) {
+            // Non-blocking: let pipeline continue while user sees the notice
+            showNotification('Partial Read', `${failedCount} files expired before read. ${capturedCount} will be processed.`, 'warning');
+        }
+
+        // ──────────────────────────────────────────────────
+        // PHASE 2: VAULT-SAVE WITH PROGRESSIVE RELEASE
+        // Now that all URIs are captured, we vault-save in chunks
+        // and NULL out references after each chunk. This progressively
+        // frees RAM instead of holding all blobs until the end.
+        //
+        // 100 files × 4MB = 400MB peak after Phase 1.
+        // After each vault chunk of 10: drops by ~40MB.
+        // ──────────────────────────────────────────────────
+        const VAULT_BATCH = 10;
+        console.log(`[Pipeline] Phase 2: Vault-saving ${capturedCount} files...`);
+
+        for (let i = 0; i < readBlobs.length; i += VAULT_BATCH) {
+            const chunkItems = [];
+
+            // Build queue items for this vault chunk
+            for (let j = i; j < i + VAULT_BATCH && j < readBlobs.length; j++) {
+                if (!readBlobs[j]) continue;
+                const data = readBlobs[j];
                 const id = uid();
-                batchItems.push({
+                chunkItems.push({
                     id,
                     blob: data.blob,
                     receipt: {
@@ -187,34 +237,27 @@ export class PipelineController {
                 });
             }
 
-            // Render ghost cards for this micro-batch
-            for (const item of batchItems) {
+            // Render ghost cards for this chunk
+            for (const item of chunkItems) {
                 addThumbnailToQueue(item.id, null, 'ghost', null, this.onDelete);
             }
 
-            // STEP 3: Vault-save this micro-batch to IDB (5 at a time)
-            const VAULT_CHUNK = 5;
-            for (let v = 0; v < batchItems.length; v += VAULT_CHUNK) {
-                const vaultChunk = batchItems.slice(v, v + VAULT_CHUNK);
-                await Promise.all(vaultChunk.map(item =>
+            // Vault-save this chunk (5 at a time for IDB concurrency)
+            const SAVE_PARALLEL = 5;
+            for (let s = 0; s < chunkItems.length; s += SAVE_PARALLEL) {
+                const saveChunk = chunkItems.slice(s, s + SAVE_PARALLEL);
+                await Promise.all(saveChunk.map(item =>
                     this._saveToVault(item.id, item.blob, item.receipt)
                 ));
             }
 
-            capturedCount += batchItems.length;
-            // References to this micro-batch's Blobs are now released
-            // (only IDB holds them). GC can reclaim the ~40MB.
+            // PROGRESSIVE RELEASE: Null out references so GC can reclaim RAM
+            for (let j = i; j < i + VAULT_BATCH && j < readBlobs.length; j++) {
+                readBlobs[j] = null;
+            }
         }
 
-        if (capturedCount === 0) {
-            showToast('Failed to read files. Please try again.', 'error');
-            return;
-        }
-        if (failedCount > 0) {
-            showToast(`${failedCount} files expired before read. ${capturedCount} will be processed.`, 'warning');
-        }
-
-        console.log(`[Pipeline] Interleaved vault complete: ${capturedCount}/${validFiles.length} files`);
+        console.log(`[Pipeline] Vault complete: ${capturedCount} files saved`);
 
         // KICKSTART CONVEYOR
         this.processConveyorBelt();
@@ -326,6 +369,9 @@ export class PipelineController {
         }
 
         while (this.activeJobs < this.MAX_ACTIVE_JOBS && this.jobQueue.length > 0) {
+            // Yield to gallery reads — don't compete for CPU/IO
+            if (this.conveyorPaused) return;
+
             if (batchState.isAtLimit) {
                 showToast('Batch limit reached', 'warning');
                 this.jobQueue = [];
@@ -360,8 +406,8 @@ export class PipelineController {
         let storedReceipt = null;
 
         try {
-            // 1. ADD GHOST CARD IMMEDIATELY (Redundant safety)
-            await addThumbnailToQueue(id, null, 'uploading', null, this.onDelete);
+            // 1. Update status — card already exists from Phase 2 vault-save
+            updateThumbnailStatus(id, 'queued');
 
             // We are GUARANTEED that the data exists because IDB spooler pushed us here.
             storedReceipt = await getReceiptFromIDB(id);
@@ -647,10 +693,8 @@ export class PipelineController {
                             status: 'synced', extracted: false, uploadedAt: window.firebase.firestore.FieldValue.serverTimestamp()
                         });
 
-                        // Increment cloud count on the batch doc
-                        await firestore.collection('batches').doc(state.batchId).update({
-                            uploadedCount: window.firebase.firestore.FieldValue.increment(1)
-                        });
+                        // NOTE: uploadedCount is incremented by the Cloud Function (main.py)
+                        // Do NOT increment here — that causes double-counting.
 
                         await deleteReceiptFromIDB(id);
                         batchState.notifyUploadComplete();

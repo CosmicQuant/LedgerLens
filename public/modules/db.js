@@ -1,4 +1,4 @@
-import { openPreview, showToast, updateThumbnailStatus } from './ui.js';
+// db.js — IndexedDB operations for receipt storage
 
 const IDB_NAME = 'ledgerlens-db';
 const IDB_VERSION = 3;
@@ -119,17 +119,31 @@ export async function getBatchCounts(batchId) {
 export async function clearIDBForBatch(batchId) {
     try {
         const database = await getIDB();
+
+        // 1. Clear receipts store
         const tx = database.transaction(STORE_NAME, 'readwrite');
         const store = tx.store;
         const index = store.index('batchId');
         let cursor = await index.openCursor(IDBKeyRange.only(batchId));
 
+        const idsToClean = [];
         while (cursor) {
+            idsToClean.push(cursor.value.id);
             await cursor.delete();
             cursor = await cursor.continue();
         }
         await tx.done;
-        console.log(`[DB] Cleared IDB zombies for batch ${batchId}`);
+
+        // 2. Clear raw_files store (orphaned files from vault-save)
+        if (idsToClean.length > 0) {
+            const tx2 = database.transaction('raw_files', 'readwrite');
+            for (const id of idsToClean) {
+                try { await tx2.store.delete(id); } catch (_) { }
+            }
+            await tx2.done;
+        }
+
+        console.log(`[DB] Cleared IDB zombies for batch ${batchId} (${idsToClean.length} items)`);
     } catch (e) {
         console.warn('[DB] Failed to clear IDB for batch:', e);
     }

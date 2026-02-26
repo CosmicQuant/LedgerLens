@@ -2,7 +2,7 @@ import { state } from './modules/state.js';
 import { db, auth, storage } from './modules/firebase-init.js';
 import { startCamera, stopCamera, captureFrame } from './modules/camera.js';
 import { getIDB, saveReceiptToIDB, deleteReceiptFromIDB, clearIDBForBatch } from './modules/db.js';
-import { DOM, showScreen, showToast, addThumbnailToQueue, updateThumbnailStatus, updateUsageMeter, showLoader, hideLoader, showNotification } from './modules/ui.js';
+import { DOM, showScreen, showToast, addThumbnailToQueue, updateThumbnailStatus, updateUsageMeter, showLoader, hideLoader, showNotification, showConfirm } from './modules/ui.js';
 import { uploader } from './modules/uploader.js';
 import { uid, sanitizeInput, escapeHtml } from './modules/utils.js';
 import { batchState } from './modules/batch-state.js';
@@ -293,11 +293,8 @@ const $inputBulk = document.getElementById('input-bulk');
 
 if ($btnGallery) {
   $btnGallery.addEventListener('click', () => {
+    if ($btnGallery.disabled) return;
     showToast('Opening Gallery...', 'info');
-    $btnGallery.disabled = true;
-    setTimeout(() => $btnGallery.disabled = false, 3000);
-    // V39 FIX: Do NOT wipe $inputBulk.value here! 
-    // This instantly kills OS file descriptors for the active batch.
     $inputBulk.click();
   });
 }
@@ -307,22 +304,30 @@ if ($inputBulk) {
     const files = Array.from(e.target.files);
     if (!files.length) return;
 
-    if (files.length > MAX_GALLERY_UPLOAD) {
-      showToast('Max 100 images per selection', 'warning');
-      $inputBulk.value = '';
-      return;
-    }
-
     if (files.length > batchState.remaining) {
       showToast(`Batch limit reached. Only ${batchState.remaining} slots left.`, 'error');
       $inputBulk.value = '';
       return;
     }
 
-    // DO NOT clear $inputBulk.value here on Android!
-    // Clearing it synchronously invalidates the active File handles for the worker/canvas.
-    // The wipe now safely happens when the user clicks the Gallery button again.
-    uploader.handleFiles(files);
+    // SAFETY LOCK: Disable gallery button during vault-save
+    // Prevents double-selection while blobs are being read + saved to IDB
+    if ($btnGallery) {
+      $btnGallery.disabled = true;
+      $btnGallery.classList.add('is-vaulting');
+    }
+
+    try {
+      // handleFiles reads files + vault-saves to IDB + kicks off conveyor
+      // It resolves when ALL blobs are safely in IDB (Phase 1 + Phase 2 complete)
+      await uploader.handleFiles(files);
+    } finally {
+      // RE-ENABLE: All blobs are in IDB, RAM is released, safe to select more
+      if ($btnGallery) {
+        $btnGallery.disabled = false;
+        $btnGallery.classList.remove('is-vaulting');
+      }
+    }
   });
 }
 
@@ -595,8 +600,9 @@ async function showHistory() {
 
     item.appendChild(infoDiv);
     item.appendChild(actionsDiv);
-    item.querySelector('.btn-restore').onclick = () => {
-      if (!confirm('Restore this batch?')) return;
+    item.querySelector('.btn-restore').onclick = async () => {
+      const confirmed = await showConfirm('Restore Batch', `Restore batch "${b.clientName || 'Unnamed'}"? This will replace your current session.`, 'Restore', 'primary');
+      if (!confirmed) return;
       showLoader('Restoring session...');
       state.setClientName(b.clientName);
       state.setBatchId(doc.id);
@@ -607,7 +613,8 @@ async function showHistory() {
     };
     item.querySelector('.btn-batch-del').onclick = async (e) => {
       e.stopPropagation();
-      if (!confirm(`Permanently delete batch "${b.clientName || 'Batch'}" and all its images? This cannot be undone.`)) return;
+      const confirmed = await showConfirm('Delete Batch', `Permanently delete batch "${b.clientName || 'Batch'}" and all its images? This cannot be undone.`, 'Delete', 'danger');
+      if (!confirmed) return;
 
       // Optimistic UI removal
       item.remove();

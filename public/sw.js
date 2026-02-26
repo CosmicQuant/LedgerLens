@@ -1,9 +1,9 @@
-const CACHE_NAME = 'ledgerlens-v80';
+const CACHE_NAME = 'ledgerlens-v91';
 const ASSETS = [
     '/',
     '/index.html',
     '/styles.css',
-    '/main.js?v=80',
+    '/main.js?v=91',
     '/modules/config.js',
     '/modules/firebase-init.js',
     '/modules/state.js',

@@ -26,12 +26,12 @@ service firebase.storage {
     }
 
     // ════════════════════════════════════════════════════
-    // Exports: /exports/{batchId}/{fileName}
+    // Exports: /exports/{userId}/{batchId}/{fileName}
     // Written by Cloud Functions (Admin SDK bypasses rules)
-    // Clients can read with auth
+    // Only the owner can read their own exports
     // ════════════════════════════════════════════════════
-    match /exports/{batchId}/{fileName} {
-      allow read: if request.auth != null;
+    match /exports/{userId}/{batchId}/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == userId;
       allow write: if false; // Only Admin SDK (Cloud Functions) can write
     }
 

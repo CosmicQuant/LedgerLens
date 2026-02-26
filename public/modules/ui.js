@@ -61,6 +61,7 @@ if (DOM.modalClose) {
             URL.revokeObjectURL(DOM.modalImg._objectUrl);
             DOM.modalImg._objectUrl = null;
         }
+        _resumeVideoFeed();
     };
 }
 
@@ -68,6 +69,7 @@ if (DOM.modal) {
     DOM.modal.onclick = (e) => {
         if (e.target === DOM.modal) {
             DOM.modal.style.display = 'none';
+            _resumeVideoFeed();
         }
     };
 }
@@ -78,75 +80,134 @@ export function showScreen(screenEl) {
 }
 
 /**
- * Replaces simple toast/alert with a professional modal.
- * @param {string} title - Title of the modal
+ * iOS Safari aggressively suspends getUserMedia streams when full-screen
+ * overlays (modals, backdrop-blur) cover the video element. Simply calling
+ * video.play() is not enough — Safari can suspend the MediaStreamTrack
+ * itself, causing the video to show the last rendered frame.
+ *
+ * This function performs three recovery steps:
+ * 1. Re-enable any disabled video tracks
+ * 2. Re-assign srcObject to force Safari to reconnect the stream
+ * 3. Call play() to resume rendering
+ */
+function _resumeVideoFeed() {
+    try {
+        const video = DOM.video;
+        if (!video || !video.srcObject) return;
+
+        const stream = video.srcObject;
+        const tracks = stream.getVideoTracks();
+
+        // 1. Re-enable tracks Safari may have disabled
+        for (const track of tracks) {
+            if (!track.enabled) track.enabled = true;
+        }
+
+        // 2. Force Safari to reconnect stream → video element
+        video.srcObject = null;
+        video.srcObject = stream;
+
+        // 3. Resume playback
+        video.play().catch(() => { });
+    } catch (e) {
+        // Non-critical — silently fail
+        console.warn('[UI] Video resume failed:', e.message);
+    }
+}
+
+/**
+ * Premium notification modal — returns a Promise that resolves with the clicked button label.
+ * @param {string} title - Modal title
  * @param {string} msg - Message body
- * @param {string} type - 'info', 'success', 'error', 'warning'
- * @param {Array} actions - Array of button objects: { label: 'OK', type: 'primary|secondary|danger', onClick: () => {} }
+ * @param {string} type - 'info' | 'success' | 'error' | 'warning'
+ * @param {Array} actions - [{ label: 'OK', type: 'primary|secondary|danger' }]
+ * @returns {Promise<string>} - Resolves with the label of the clicked button
  */
 export function showNotification(title, msg, type = 'info', actions = []) {
     // Remove existing if any
     const existing = document.querySelector('.notification-modal-overlay');
     if (existing) existing.remove();
 
-    const overlay = document.createElement('div');
-    overlay.className = 'notification-modal-overlay active';
-
-    // Icon mapping
-    const icons = {
-        info: 'info',
-        success: 'check_circle',
-        error: 'error',
-        warning: 'warning'
-    };
-
     // Default action if none provided
     if (!actions.length) {
-        actions.push({ label: 'OK', type: 'primary', onClick: () => overlay.remove() });
+        actions = [{ label: 'OK', type: 'primary' }];
     }
 
-    const btnsHtml = actions.map((btn, idx) => `
-        <button class="notification-btn ${btn.type || 'secondary'}" data-idx="${idx}">
-            ${btn.label}
-        </button>
-    `).join('');
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'notification-modal-overlay';
 
-    overlay.innerHTML = `
-        <div class="notification-card">
-            <div class="notification-icon ${type}">
-                <span class="material-symbols-rounded">${icons[type] || 'info'}</span>
+        // Icon mapping
+        const icons = { info: 'info', success: 'check_circle', error: 'error', warning: 'warning' };
+
+        const btnsHtml = actions.map((btn, idx) => `
+            <button class="notification-btn ${btn.type || 'secondary'}" data-idx="${idx}">
+                ${btn.label}
+            </button>
+        `).join('');
+
+        overlay.innerHTML = `
+            <div class="notification-card">
+                <div class="notification-icon ${type}">
+                    <span class="material-symbols-rounded">${icons[type] || 'info'}</span>
+                </div>
+                <h3 class="notification-title"></h3>
+                <p class="notification-message"></p>
+                <div class="notification-actions">
+                    ${btnsHtml}
+                </div>
             </div>
-            <h3 class="notification-title"></h3>
-            <p class="notification-message"></p>
-            <div class="notification-actions">
-                ${btnsHtml}
-            </div>
-        </div>
-    `;
+        `;
 
-    // XSS-safe: set user-controlled content via textContent
-    overlay.querySelector('.notification-title').textContent = title;
-    overlay.querySelector('.notification-message').textContent = msg;
+        // XSS-safe: set user-controlled content via textContent
+        overlay.querySelector('.notification-title').textContent = title;
+        overlay.querySelector('.notification-message').textContent = msg;
 
-    document.body.appendChild(overlay);
+        document.body.appendChild(overlay);
+        // Trigger animation on next frame
+        requestAnimationFrame(() => overlay.classList.add('active'));
 
-    // Bind events
-    const buttons = overlay.querySelectorAll('.notification-btn');
-    buttons.forEach(btn => {
-        btn.onclick = () => {
-            const idx = btn.getAttribute('data-idx');
-            const action = actions[idx];
-            if (action.onClick) action.onClick();
-            if (!action.keepOpen) overlay.remove();
-        };
+        // Bind button events
+        overlay.querySelectorAll('.notification-btn').forEach(btn => {
+            btn.onclick = () => {
+                const idx = btn.getAttribute('data-idx');
+                overlay.classList.remove('active');
+                setTimeout(() => {
+                    overlay.remove();
+                    _resumeVideoFeed();
+                }, 250);
+                resolve(actions[idx].label);
+            };
+        });
     });
 }
 
-// Keep showToast for non-intrusive updates, but redirect alerts to showNotification
+/**
+ * Convenience: confirm dialog that returns true/false.
+ * @param {string} title
+ * @param {string} msg
+ * @param {string} confirmLabel - e.g. 'Delete', 'Restore'
+ * @param {string} confirmType - 'danger' or 'primary'
+ * @returns {Promise<boolean>}
+ */
+export async function showConfirm(title, msg, confirmLabel = 'Confirm', confirmType = 'primary') {
+    const result = await showNotification(title, msg, 'warning', [
+        { label: 'Cancel', type: 'secondary' },
+        { label: confirmLabel, type: confirmType }
+    ]);
+    return result === confirmLabel;
+}
+
+// Keep showToast for non-intrusive status updates
 export function showToast(msg, type = 'info', duration = 3000) {
-    // If it's an error, use the modal for better visibility
+    // Errors → modal for better visibility
     if (type === 'error') {
         showNotification('Error', msg, 'error');
+        return;
+    }
+    // Warnings → modal so user acknowledges
+    if (type === 'warning') {
+        showNotification('Attention', msg, 'warning');
         return;
     }
 

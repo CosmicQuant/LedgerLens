@@ -17,7 +17,7 @@ import { state } from './state.js';
 import { showToast } from './ui.js';
 
 const CHECK_INTERVAL_MS = 15000; // Check every 15s
-const STALL_THRESHOLD_MS = 25000; // 25s timeout for extraction (sole retry system)
+const STALL_THRESHOLD_MS = 45000; // 45s timeout — accounts for Cloud Function cold starts
 const MAX_RETRIES = 3;
 
 let watchdogTimer = null;

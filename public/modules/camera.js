@@ -111,6 +111,10 @@ export async function captureFrame(videoElement) {
         // Shutter: Capture instantaneous bitmap
         const bitmap = await createImageBitmap(videoElement);
 
+        // iOS Safari fix: createImageBitmap() can pause the video stream.
+        // Explicitly resume playback to prevent the camera from freezing.
+        videoElement.play().catch(() => { });
+
         // Pre-downscale to MAX_WIDTH to reduce blob size and RAM pressure.
         // A 1920×1080 frame at full quality = ~2MB blob + 8MB pixel buffer.
         // At 1500px wide = ~500KB blob + 4MB pixel buffer — 50% RAM savings.
@@ -143,6 +147,8 @@ export async function captureFrame(videoElement) {
         });
     } catch (err) {
         console.error("[Camera] Shutter failed:", err);
+        // Last resort: try to resume video even on error
+        videoElement.play().catch(() => { });
         return null;
     }
 }

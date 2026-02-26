@@ -235,8 +235,8 @@ def on_receipt_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]
             return
 
         parts = file_path.split("/")
-        if len(parts) < 3: return
-        batch_id, receipt_id = parts[1], parts[2].rsplit(".", 1)[0]
+        if len(parts) < 4: return  # receipts/{userId}/{batchId}/{filename}
+        user_id, batch_id, receipt_id = parts[1], parts[2], parts[3].rsplit(".", 1)[0]
 
         # ── IDEMPOTENT SYNC COUNT ────────────────────────
         db = firestore.client()
@@ -287,6 +287,10 @@ def process_receipt_extraction(batch_id: str, receipt_id: str, bucket_name: str,
     
     try:
         print(f"[Process] batch={batch_id} receipt={receipt_id} path={file_path}")
+
+        # Signal to the client that AI extraction has started
+        receipt_ref = db.collection("batches").document(batch_id).collection("receipts").document(receipt_id)
+        receipt_ref.set({"status": "processing"}, merge=True)
 
         # Read batch doc for custom categories
         batch_doc = db.collection("batches").document(batch_id).get()
