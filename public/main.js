@@ -13,10 +13,28 @@ import { startWatchdog, stopWatchdog } from './modules/watchdog.js';
 // ────────────────────────────────────────────────────────
 batchState.subscribe((payload) => {
   updateUsageMeter(payload);
+
+  const processingCount = document.querySelectorAll('.is-processing').length;
+  const isBusy = payload.totalCount === 0 || payload.pendingCount > 0 || processingCount > 0;
+
   if (DOM.btnExport) {
-    const processingCount = document.querySelectorAll('.is-processing').length;
-    const busy = payload.totalCount === 0 || payload.pendingCount > 0 || processingCount > 0;
-    DOM.btnExport.disabled = busy;
+    DOM.btnExport.disabled = isBusy;
+  }
+
+  const btnGallery = document.getElementById('btn-gallery');
+  if (btnGallery) {
+    // Lock gallery ONLY while phone is actively compressing/uploading.
+    // Cloud extraction (processingCount) consumes ZERO phone resources,
+    // so we can safely unlock the gallery while AI runs in the background.
+    const pipelineBusy = uploader.isBusy;
+    btnGallery.classList.toggle('disabled', pipelineBusy);
+
+    // Optional tooltip update based on state
+    if (pipelineBusy) {
+      btnGallery.setAttribute('title', 'Please wait for current images to finish uploading');
+    } else {
+      btnGallery.removeAttribute('title');
+    }
   }
 });
 
@@ -132,10 +150,10 @@ async function tryRestoreSession() {
   }
 }
 
-function resetApp(isPopState = false) {
+async function resetApp(isPopState = false) {
   if (DOM.setup.classList.contains('active')) return;
 
-  if (confirm('Exit current batch? Unsynced images will be kept in history.')) {
+  if (await showConfirm('Exit current batch? Unsynced images will be kept in history.')) {
     stopCamera(DOM.video);
     stopWatchdog();
 
@@ -164,13 +182,13 @@ function resetApp(isPopState = false) {
 // ────────────────────────────────────────────────────────
 
 // Handle Android Back Button (History API)
-window.addEventListener('popstate', (event) => {
+window.addEventListener('popstate', async (event) => {
   console.log('[History] Popstate:', window.location.hash);
   // If user hits 'back' from camera screen
   if (DOM.camera.classList.contains('active') && window.location.hash !== '#camera') {
     // Only reset if they are actually moving AWAY from camera
     if (window.location.hash === '' || window.location.hash === '#setup') {
-      resetApp(true);
+      await resetApp(true);
     }
   } else if (window.location.hash === '#camera' && !DOM.camera.classList.contains('active')) {
     tryRestoreSession();
@@ -294,6 +312,13 @@ const $inputBulk = document.getElementById('input-bulk');
 if ($btnGallery) {
   $btnGallery.addEventListener('click', () => {
     if ($btnGallery.disabled) return;
+
+    // Second layer of defense against rapid clicks
+    if ($btnGallery.classList.contains('disabled')) {
+      showToast('Please wait for current images to finish...', 'warning');
+      return;
+    }
+
     showToast('Opening Gallery...', 'info');
     $inputBulk.click();
   });
@@ -344,7 +369,7 @@ if ($inputBulk) {
 
 // Delete Receipt
 async function deleteReceipt(id) {
-  if (!confirm('Delete this receipt permanently?')) return;
+  if (!(await showConfirm('Delete this receipt permanently?'))) return;
 
   // PILLAR 8: Pre-emptive Task Cancellation
   uploader.cancelJob(id);
@@ -515,7 +540,7 @@ if (DOM.btnGoogleLogin) {
 
 if (DOM.btnLogout) {
   DOM.btnLogout.onclick = async () => {
-    if (confirm('Sign out?')) {
+    if (await showConfirm('Sign out?')) {
       await auth.signOut();
       window.location.reload();
     }

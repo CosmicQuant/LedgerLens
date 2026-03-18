@@ -65,6 +65,13 @@ if (DOM.modalClose) {
     };
 }
 
+export function unlockGalleryButton() {
+    if (DOM.btnGallery) {
+        DOM.btnGallery.classList.remove('disabled');
+        DOM.btnGallery.removeAttribute('title');
+    }
+}
+
 if (DOM.modal) {
     DOM.modal.onclick = (e) => {
         if (e.target === DOM.modal) {

@@ -861,8 +861,16 @@ body {
 }
 
 .q-card.is-processing .badge-proc {
-  display: block;
+  display: flex !important;
   animation: pulse 1.5s infinite;
+}
+
+.q-card.compressing .badge-proc {
+  display: flex !important;
+}
+
+.q-card.processing .badge-proc {
+  display: flex !important;
 }
 
 @keyframes pulse {
@@ -960,9 +968,15 @@ body {
   backdrop-filter: blur(4px);
 }
 
-.btn-icon-pill:hover {
+.btn-icon-pill:hover:not(.disabled) {
   background: rgba(0, 0, 0, 0.6);
   transform: scale(1.05);
+}
+
+.btn-icon-pill.disabled {
+  background: rgba(128, 128, 128, 0.6); /* Turn grey as requested */
+  cursor: not-allowed;
+  opacity: 0.7;
 }
 
 /* ── Queue Strip (Ultra Lean Overlay) ───────────────── */

@@ -21,7 +21,8 @@ import {
     showToast,
     showNotification,
     updateThumbnailStatus,
-    addThumbnailToQueue
+    addThumbnailToQueue,
+    unlockGalleryButton
 } from './ui.js';
 import { batchState } from './batch-state.js';
 import { uid } from './utils.js';
@@ -57,6 +58,10 @@ export class PipelineController {
         this.onDelete = null; // Callback for UI delete buttons
 
         console.log(`[Pipeline] Initialized (Conveyor Slots: ${this.MAX_ACTIVE_JOBS}) 🚀`);
+    }
+
+    get isBusy() {
+        return this.activeJobs > 0 || this.jobQueue.length > 0;
     }
 
     setDeleteCallback(fn) {
@@ -174,6 +179,10 @@ export class PipelineController {
         for (let i = 0; i < validFiles.length; i++) {
             const file = validFiles[i];
             try {
+                // Synchronous-like memory read. NO YIELDS.
+                // Yielding the event loop allows Android to revoke the content:// URI.
+                // We rely on the Gallery button being disabled while jobs are active
+                // to ensure zero I/O contention during this phase.
                 const ab = await file.arrayBuffer();
                 readBlobs.push({
                     blob: new Blob([ab], { type: file.type || 'image/jpeg' }),
@@ -391,6 +400,10 @@ export class PipelineController {
                     // V39 STRICT BATCH COMPLETION WIPE:
                     const inputBulk = document.getElementById('input-bulk');
                     if (inputBulk) inputBulk.value = '';
+
+                    // Force the UI to re-render the gallery button unlock (via state and directly)
+                    batchState.notifyChange();
+                    unlockGalleryButton();
                 } else {
                     this.processConveyorBelt();
                 }
@@ -673,11 +686,13 @@ export class PipelineController {
                     clearInterval(killSwitchTimer);
                     console.error(`[Pipeline] Upload task failed for ${id}:`, error ? error.message : '', error);
                     updateThumbnailStatus(id, 'error');
+                    batchState.notifyUploadComplete(); // Force UI update on error
                     reject(error);
                 },
                 async () => {
                     clearInterval(killSwitchTimer);
                     if (task.snapshot.state === 'canceled') {
+                        batchState.notifyUploadComplete(); // Force UI update on cancel
                         return reject(new Error('Task Canceled'));
                     }
 
